@@ -8,7 +8,7 @@ __all__ = ["all_nearest_neighbours"]
 
 
 def all_nearest_neighbours(x, y):
-    """For all points in x find the nearest neighbor among points in z.
+    """For all points in x find the nearest neighbor among points in y.
 
     Parameters
     ----------
@@ -27,7 +27,6 @@ def all_nearest_neighbours(x, y):
     """
     if not isinstance(x, Delaunay):
         _assert_cloud_3d(x)
-        x = x.astype(np.float64, copy=False)
 
         # Calculate delaunay triangulation
         x = Delaunay(x, qhull_options="QJ")
@@ -36,7 +35,6 @@ def all_nearest_neighbours(x, y):
 
     if not isinstance(y, Delaunay):
         _assert_cloud_3d(y)
-        y = y.astype(np.float64, copy=False)
 
         # Calculate delaunay triangulation
         y = Delaunay(y, qhull_options="QJ")
@@ -44,12 +42,12 @@ def all_nearest_neighbours(x, y):
         _assert_cloud_3d(y.points)
 
     return _aann.all_nearest_neighbours(
-        x.points,
+        x.points.astype(np.float64, copy=False),
         x.vertex_neighbor_vertices[0].astype(np.uint64, copy=False),
         x.vertex_neighbor_vertices[1].astype(np.uint64, copy=False),
-        y.points,
+        y.points.astype(np.float64, copy=False),
         y.vertex_neighbor_vertices[0].astype(np.uint64, copy=False),
-        y.vertex_neighbor_vertices[1].astype(np.uint64, copy=False),
+        y.vertex_neighbor_vertices[1].astype(np.uint64, copy=False)
     )
 
 

@@ -15,6 +15,9 @@ Given two point clouds `Q` and `P`, find the nearest neighbor of each point in `
 3. Move to a neighbor of `q` and search `P` for its nearest neighbor using `p` as the start. Since that we start the search where we have already established spatial proximity the A* search should finish sooner.
 4. Rinse-repeat until we found nearest neighbors for all points in `Q`.
 
+## Benchmarks
+TODO
+
 ## Build
 1. `cd` into directory
 2. Activate virtual environment: `source .venv/bin/activate`
