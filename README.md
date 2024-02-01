@@ -7,12 +7,12 @@ DELAUNAY GRAPHS, Soudani & Karami, 2018 (arXiv)
 
 ### Problem
 
-Given two point clouds `Q` and `P`, find the nearest neighbor of each point in `P` among the the points of `Q`.
+Given two point clouds `Q` and `P`, for each point `q` in `Q` find its nearest neighbor `p` among the points in `P`.
 
 ### Solution
 1. Calculate Delaunay graphs for both point clouds.
 2. Start with a random vertex `q` in `Q` and traverse `P` using an A* search to find its nearest neighbor `p`.
-3. Move to a neighbor of `q` and search `P` for its nearest neighbor using `p` as the start. Since that we start the search where we have already established spatial proximity the A* search should finish sooner.
+3. Move to a vertex adjacent to `q` and search `P` for its nearest neighbor using `p` as the start. Since we start the search where we have already established spatial proximity the A* search should finish quickly.
 4. Rinse-repeat until we found nearest neighbors for all points in `Q`.
 
 ## Benchmarks
