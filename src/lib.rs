@@ -5,15 +5,31 @@ use pyo3::prelude::Python;
 
 /// A Delaunay triangulation.
 ///
+/// Arguments:
+///  points: (N, 3) Array of points in the triangulation
+///  indices: (N+1,) Array of indices into `neighbors` for each vertex
+///  neighbors: (M,) Array of indices into `points` for each vertex
+///
+/// To get the neighbors of point `i``, we need need use:
+/// neighbors[indices[i]:indices[i+1]]
 struct Delaunay {
     // The (N, 3) points in the triangulation
     points: Array2<f64>,
-    //
+    // The indices of neighboring vertices of vertex k are
+    // neighbors[indices[k]:indices[k+1]].
     indices: Array1<usize>,
     neighbors: Array1<usize>,
 }
 
 /// Find all nearest neighbors between two point clouds using Delaunay triangulations.
+///
+/// Arguments:
+///  x_points: (N, 3) Array of points in the first point cloud
+///  x_indices: (N+1,) Array of indices into `x_neighbors` for each vertex
+///  x_neighbors: (M,) Array of indices into `x_points` for each vertex
+///  y_points: (L, 3) Array of points in the second point cloud
+///  y_indices: (L+1,) Array of indices into `y_neighbors` for each vertex
+///  y_neighbors: (O,) Array of indices into `y_points` for each vertex
 #[pyfunction]
 fn all_nearest_neighbours<'py>(
     py: Python<'py>,
@@ -50,8 +66,8 @@ fn all_nearest_neighbours<'py>(
     distances[vertex] = d;
     indices[vertex] = ix;
 
-    // Our stack will contain a vertex in `y` and vertices in `x` that
-    // we expect to be in the vicinity
+    // Our stack will contain a vertex in `y` and a vertex in `x` that
+    // we expect to be in the vicinity of `y`'s nearest neighbor
     let mut stack: Vec<(usize, usize)> = vec![];
     let mut visited = Array1::from_elem(x.indices.len(), false);
     for n in get_neighbours(&x, vertex) {
@@ -108,10 +124,15 @@ fn euclidean_distance_to_point(p: &ArrayView1<f64>, points: &ArrayView2<f64>) ->
 }
 
 /// Find the approximate nearest neighbor of point p among the points in y.
+///
 /// Arguments:
-///   y: Delaunay triangulation of the points to search in
-///   p: (N, 3) Point to search for
-///   start: Index of the point in y to start the search from
+///  y: Delaunay triangulation of the points to search in
+///  p: (N, 3) Point to find the nearest neighbor in `y` for
+///  start: Index of a point in y where to start the search from
+///
+/// Returns:
+///  d: The distance between p and the nearest neighbor
+///  vertex: The index of the nearest neighbor
 fn _find_nearest_neighbour(y: &Delaunay, p: &ArrayView1<f64>, start: usize) -> (f64, usize) {
     let mut vertex: usize = start;
 
@@ -154,7 +175,14 @@ fn _find_nearest_neighbour(y: &Delaunay, p: &ArrayView1<f64>, start: usize) -> (
     (d.sqrt(), vertex)
     }
 
-/// Find the neighbours for vertex in delaunay triangulation x.
+/// Find the neighbours for `vertex` in delaunay triangulation `x`.
+///
+/// Arguments:
+///  x: Delaunay triangulation
+///  vertex: Index of the vertex to find the neighbours for
+///
+/// Returns:
+///  Array of indices of the neighbours of `vertex`
 fn get_neighbours(
     x: &Delaunay,
     vertex: usize
