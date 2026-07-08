@@ -4,11 +4,42 @@ build-backend = "maturin"
 
 [project]
 name = "aann"
+description = "Approximate all-nearest-neighbor search using neighborhood graphs, implemented in Rust with Python bindings."
+readme = "README.md"
 requires-python = ">=3.10"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Philipp Schlegel" },
+]
+keywords = [
+    "nearest-neighbor",
+    "approximate-nearest-neighbor",
+    "ann",
+    "delaunay",
+    "neighborhood-graph",
+    "spatial",
+    "kdtree",
+    "nblast",
+]
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: OS Independent",
     "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dynamic = ["version"]
 dependencies = [
@@ -16,6 +47,11 @@ dependencies = [
     "scipy>=1.0.0",
     "shull>=0.2.0"
 ]
+
+[project.urls]
+Homepage = "https://github.com/schlegelp/aann"
+Repository = "https://github.com/schlegelp/aann"
+Issues = "https://github.com/schlegelp/aann/issues"
 
 [tool.maturin]
 module-name = "aann._aann"
