@@ -1,13 +1,45 @@
+//! Approximate all-nearest-neighbour search over neighbourhood graphs.
+//!
+//! Given two 3D point clouds, each equipped with a neighbourhood graph in CSR
+//! form (e.g. the vertex adjacency of a Delaunay triangulation, see
+//! [`graph_from_simplices`]), this crate finds for every point of the query
+//! cloud its (approximate) nearest neighbour(s) in the target cloud via a
+//! warm-started greedy graph descent. Distances are SIMD-accelerated, which is
+//! why the crate requires a **nightly** toolchain (`portable_simd`).
+//!
+//! The Python bindings live behind the non-default `python` cargo feature;
+//! with default features this is a pure-Rust library.
+//!
+//! ```
+//! use aann::{graph_from_simplices, PreparedF64};
+//! use aann::ndarray::array;
+//!
+//! // Target cloud: the 4 corners of the unit tetrahedron, fully connected
+//! // by a single Delaunay simplex.
+//! let points = array![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+//! let (indptr, indices) = graph_from_simplices(array![[0u64, 1, 2, 3]].view(), 4);
+//! let target = PreparedF64::new(points.view(), indptr.view(), indices.view());
+//!
+//! // Query cloud with its own neighbourhood graph (here: two points linked
+//! // to each other).
+//! let queries = array![[0.1, 0.0, 0.0], [0.9, 0.1, 0.0]];
+//! let (qptr, qidx) = (array![0usize, 1, 2], array![1usize, 0]);
+//! let (dists, idxs) = target.query(queries.view(), qptr.view(), qidx.view());
+//! assert_eq!(idxs.to_vec(), vec![0, 1]);
+//! assert!((dists[0] - 0.1).abs() < 1e-12);
+//! ```
 #![feature(portable_simd)]
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2, PyReadonlyArray1};
-use pyo3::prelude::*;
 use core::simd::prelude::{f32x4, f64x4};
 use std::simd::num::SimdFloat;
 use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+
+/// The version of `ndarray` this crate's API is built against, re-exported so
+/// consumers don't have to pin a matching version themselves.
+pub use ndarray;
 
 /// Generate a full nearest-neighbour search pipeline for one coordinate type.
 ///
@@ -17,36 +49,39 @@ use std::collections::BinaryHeap;
 /// precision. We therefore monomorphise both via this macro.
 ///
 /// Parameters:
-///  `$t`      scalar coordinate type (`f32` / `f64`)
-///  `$simd`   4-lane SIMD vector for `$t` (`f32x4` / `f64x4`)
-///  `$nbhd`   generated neighbourhood-graph struct name
-///  `$dist`   generated squared-distance helper name
-///  `$neigh`  generated neighbour-slice helper name
-///  `$find`   generated single nearest-neighbour search name
-///  `$pyfn`   generated `#[pyfunction]` name exposed to Python
-///  `$hitem`  generated (distance, index) heap-item struct name
-///  `$findk`  generated k>1 best-first search name
-///  `$pyfnk`  generated k>1 `#[pyfunction]` name exposed to Python
+///  `$t`        scalar coordinate type (`f32` / `f64`)
+///  `$simd`     4-lane SIMD vector for `$t` (`f32x4` / `f64x4`)
+///  `$nbhd`     generated neighbourhood-graph struct name
+///  `$dist`     generated squared-distance helper name
+///  `$neigh`    generated neighbour-slice helper name
+///  `$find`     generated single nearest-neighbour search name
+///  `$search`   generated all-nearest-neighbours search name
+///  `$hitem`    generated (distance, index) heap-item struct name
+///  `$findk`    generated k>1 best-first search name
+///  `$searchk`  generated k>1 all-nearest-neighbours search name
+///  `$pack`     generated SIMD point-packing helper name
+///  `$prepared` generated owned, pre-packed graph struct name
 macro_rules! impl_ann_for {
-    ($t:ty, $simd:ty, $nbhd:ident, $dist:ident, $neigh:ident, $find:ident, $search:ident, $pyfn:ident,
-     $hitem:ident, $findk:ident, $searchk:ident, $pyfnk:ident, $pack:ident, $prepared:ident) => {
+    ($t:ty, $simd:ty, $nbhd:ident, $dist:ident, $neigh:ident, $find:ident, $search:ident,
+     $hitem:ident, $findk:ident, $searchk:ident, $pack:ident, $prepared:ident) => {
         /// A neighborhood graph over `$t` coordinates.
         ///
-        /// `indices`/`neighbors` are zero-copy CSR views into the numpy inputs:
-        /// the neighbours of vertex `k` are `neighbors[indices[k]..indices[k+1]]`.
+        /// `indices`/`neighbors` are zero-copy CSR views into the caller's
+        /// arrays: the neighbours of vertex `k` are
+        /// `neighbors[indices[k]..indices[k+1]]`.
         /// `points_simd` holds points pre-packed as `[x, y, z, 0.0]` for SIMD
         /// distances (see `$pack`), as a `Cow`: freshly packed callers pass
         /// `Owned`, while a persistent `$prepared` passes `Borrowed` so it packs
         /// once at construction and reuses it across every query instead of
         /// repacking on each call.
-        struct $nbhd<'a> {
+        pub struct $nbhd<'a> {
             indices: ArrayView1<'a, usize>,
             neighbors: ArrayView1<'a, usize>,
             points_simd: Cow<'a, [$simd]>,
         }
 
         impl<'a> $nbhd<'a> {
-            fn new(
+            pub fn new(
                 points_simd: Cow<'a, [$simd]>,
                 indices: ArrayView1<'a, usize>,
                 neighbors: ArrayView1<'a, usize>,
@@ -56,7 +91,7 @@ macro_rules! impl_ann_for {
         }
 
         /// Pack an `(N, 3)` point array into SIMD `[x, y, z, 0.0]` lanes.
-        fn $pack(points: ArrayView2<$t>) -> Vec<$simd> {
+        pub fn $pack(points: ArrayView2<$t>) -> Vec<$simd> {
             let mut packed: Vec<$simd> = Vec::with_capacity(points.nrows());
             for p in points.outer_iter() {
                 packed.push(<$simd>::from_array([p[0], p[1], p[2], 0.0]));
@@ -66,7 +101,7 @@ macro_rules! impl_ann_for {
 
         /// Squared euclidean distance between two packed points.
         #[inline]
-        fn $dist(a: &$simd, b: &$simd) -> $t {
+        pub fn $dist(a: &$simd, b: &$simd) -> $t {
             let diff = a - b;
             (diff * diff).reduce_sum()
         }
@@ -82,7 +117,7 @@ macro_rules! impl_ann_for {
         /// strictly-closer node, so the running distance is always the smallest
         /// seen and an already-examined node can never be re-selected -- hence no
         /// explicit "visited" set is needed.
-        fn $find(y: &$nbhd, p: &$simd, start: usize) -> ($t, usize) {
+        pub fn $find(y: &$nbhd, p: &$simd, start: usize) -> ($t, usize) {
             let mut vertex: usize = start;
             let mut d = $dist(&y.points_simd[vertex], p);
 
@@ -105,9 +140,9 @@ macro_rules! impl_ann_for {
             (d.sqrt(), vertex)
         }
 
-        /// The full all-nearest-neighbours search over two graphs. Pure Rust
-        /// (no Python), so it can run with the GIL released.
-        fn $search(x: &$nbhd, y: &$nbhd) -> (Array1<$t>, Array1<usize>) {
+        /// The full all-nearest-neighbours search over two graphs: for each
+        /// point in `x`, find its nearest neighbour among the points in `y`.
+        pub fn $search(x: &$nbhd, y: &$nbhd) -> (Array1<$t>, Array1<usize>) {
             let n_x = x.indices.len() - 1;
             let mut distances = Array1::<$t>::zeros(n_x);
             let mut indices = Array1::<usize>::zeros(n_x);
@@ -234,7 +269,7 @@ macro_rules! impl_ann_for {
         /// than `k` results (disconnected graph or k > |y|); the outer loop
         /// restarts the walk on every unvisited `x` vertex, so disconnected
         /// query graphs are covered too.
-        fn $searchk(x: &$nbhd, y: &$nbhd, k: usize, ef: usize) -> (Array2<$t>, Array2<usize>) {
+        pub fn $searchk(x: &$nbhd, y: &$nbhd, k: usize, ef: usize) -> (Array2<$t>, Array2<usize>) {
             let n_x = x.indices.len() - 1;
             let n_y = y.points_simd.len();
             let mut distances = Array2::<$t>::from_elem((n_x, k), <$t>::INFINITY);
@@ -285,224 +320,100 @@ macro_rules! impl_ann_for {
             (distances, indices)
         }
 
-        /// Find, for each point in `x`, the nearest neighbour among points in `y`
-        /// (both given as neighbourhood graphs). The heavy search runs with the
-        /// GIL released, so independent calls (e.g. an all-by-all join driven
-        /// from a Python thread pool) execute in parallel across cores.
-        #[pyfunction]
-        fn $pyfn<'py>(
-            py: Python<'py>,
-            x_points: PyReadonlyArray2<$t>,
-            x_indices: PyReadonlyArray1<usize>,
-            x_neighbors: PyReadonlyArray1<usize>,
-            y_points: PyReadonlyArray2<$t>,
-            y_indices: PyReadonlyArray1<usize>,
-            y_neighbors: PyReadonlyArray1<usize>,
-        ) -> PyResult<(Bound<'py, PyArray1<$t>>, Bound<'py, PyArray1<usize>>)> {
-            // Extract zero-copy views under the GIL (cheap), then release the GIL
-            // for the whole search -- graph packing and descent are pure Rust.
-            let xp = x_points.as_array();
-            let xi = x_indices.as_array();
-            let xn = x_neighbors.as_array();
-            let yp = y_points.as_array();
-            let yi = y_indices.as_array();
-            let yn = y_neighbors.as_array();
-
-            let (distances, indices) = py.detach(move || {
-                let x = $nbhd::new(Cow::Owned($pack(xp)), xi, xn);
-                let y = $nbhd::new(Cow::Owned($pack(yp)), yi, yn);
-                $search(&x, &y)
-            });
-
-            Ok((distances.into_pyarray(py), indices.into_pyarray(py)))
-        }
-
-        /// The k>1 variant: for each point in `x` find the `k` nearest
-        /// neighbours among the points in `y`, exploring `ef >= k` candidates
-        /// per query (recall/speed trade-off). Returns (N, k) arrays with rows
-        /// sorted ascending by distance; missing entries (search exhausted) are
-        /// (inf, |y|). Runs with the GIL released, like the k=1 variant.
-        #[pyfunction]
-        fn $pyfnk<'py>(
-            py: Python<'py>,
-            x_points: PyReadonlyArray2<$t>,
-            x_indices: PyReadonlyArray1<usize>,
-            x_neighbors: PyReadonlyArray1<usize>,
-            y_points: PyReadonlyArray2<$t>,
-            y_indices: PyReadonlyArray1<usize>,
-            y_neighbors: PyReadonlyArray1<usize>,
-            k: usize,
-            ef: usize,
-        ) -> PyResult<(Bound<'py, PyArray2<$t>>, Bound<'py, PyArray2<usize>>)> {
-            let xp = x_points.as_array();
-            let xi = x_indices.as_array();
-            let xn = x_neighbors.as_array();
-            let yp = y_points.as_array();
-            let yi = y_indices.as_array();
-            let yn = y_neighbors.as_array();
-
-            let (distances, indices) = py.detach(move || {
-                let x = $nbhd::new(Cow::Owned($pack(xp)), xi, xn);
-                let y = $nbhd::new(Cow::Owned($pack(yp)), yi, yn);
-                $searchk(&x, &y, k, ef)
-            });
-
-            Ok((distances.into_pyarray(py), indices.into_pyarray(py)))
-        }
-
         /// A prepared neighbourhood graph that **owns** its SIMD-packed points
         /// and CSR adjacency, so the packing is done once at construction and
         /// reused across every `query`. This is the persistent counterpart to
-        /// the per-call `$pyfn`: building `tree = $prepared(...)` once and
-        /// calling `tree.query(...)` many times (e.g. one target vs many query
-        /// clouds, or an all-by-all) avoids repacking the target on each call.
+        /// the per-call `$search`: building `let tree = $prepared::new(...)`
+        /// once and calling `tree.query(...)` many times (e.g. one target vs
+        /// many query clouds, or an all-by-all) avoids repacking the target on
+        /// each call.
         ///
         /// Note: the query points passed to `query`/`query_k` still carry their
         /// own neighbourhood graph -- the warm-started descent needs it -- so
         /// this is a cloud-vs-cloud tool, not a scattered-point KD-tree lookup.
-        #[pyclass]
-        struct $prepared {
+        pub struct $prepared {
             points_simd: Vec<$simd>,
             indptr: Vec<usize>,
             indices: Vec<usize>,
             n: usize,
         }
 
-        #[pymethods]
         impl $prepared {
-            #[new]
-            fn new(
-                points: PyReadonlyArray2<$t>,
-                indptr: PyReadonlyArray1<usize>,
-                indices: PyReadonlyArray1<usize>,
+            pub fn new(
+                points: ArrayView2<$t>,
+                indptr: ArrayView1<usize>,
+                indices: ArrayView1<usize>,
             ) -> Self {
-                let pts = points.as_array();
-                let n = pts.nrows();
+                let n = points.nrows();
                 $prepared {
-                    points_simd: $pack(pts),
-                    indptr: indptr.as_array().to_vec(),
-                    indices: indices.as_array().to_vec(),
+                    points_simd: $pack(points),
+                    indptr: indptr.to_vec(),
+                    indices: indices.to_vec(),
                     n,
                 }
             }
 
+            /// Borrow this prepared graph as a `$nbhd` view (no packing, no
+            /// copying -- the `Cow::Borrowed` fast path).
+            pub fn as_graph(&self) -> $nbhd<'_> {
+                $nbhd::new(
+                    Cow::Borrowed(self.points_simd.as_slice()),
+                    ArrayView1::from(self.indptr.as_slice()),
+                    ArrayView1::from(self.indices.as_slice()),
+                )
+            }
+
             /// Nearest neighbour in the prepared target for each point of the
-            /// query cloud `x` (given as its own CSR graph). Mirrors `$pyfn`
-            /// but reuses `self`'s pre-packed points. GIL released for the
-            /// search; `self`'s owned buffers are `Send`.
-            fn query<'py>(
+            /// query cloud `x` (given as its own CSR graph). Mirrors `$search`
+            /// but reuses `self`'s pre-packed points.
+            pub fn query(
                 &self,
-                py: Python<'py>,
-                x_points: PyReadonlyArray2<$t>,
-                x_indptr: PyReadonlyArray1<usize>,
-                x_indices: PyReadonlyArray1<usize>,
-            ) -> PyResult<(Bound<'py, PyArray1<$t>>, Bound<'py, PyArray1<usize>>)> {
-                let xp = x_points.as_array();
-                let xi = x_indptr.as_array();
-                let xn = x_indices.as_array();
-
-                let (distances, indices) = py.detach(move || {
-                    let x = $nbhd::new(Cow::Owned($pack(xp)), xi, xn);
-                    let y = $nbhd::new(
-                        Cow::Borrowed(self.points_simd.as_slice()),
-                        ArrayView1::from(self.indptr.as_slice()),
-                        ArrayView1::from(self.indices.as_slice()),
-                    );
-                    $search(&x, &y)
-                });
-
-                Ok((distances.into_pyarray(py), indices.into_pyarray(py)))
+                x_points: ArrayView2<$t>,
+                x_indptr: ArrayView1<usize>,
+                x_indices: ArrayView1<usize>,
+            ) -> (Array1<$t>, Array1<usize>) {
+                let x = $nbhd::new(Cow::Owned($pack(x_points)), x_indptr, x_indices);
+                $search(&x, &self.as_graph())
             }
 
             /// The k>1 variant of `query` (best-first search, `ef` breadth).
-            fn query_k<'py>(
+            pub fn query_k(
                 &self,
-                py: Python<'py>,
-                x_points: PyReadonlyArray2<$t>,
-                x_indptr: PyReadonlyArray1<usize>,
-                x_indices: PyReadonlyArray1<usize>,
+                x_points: ArrayView2<$t>,
+                x_indptr: ArrayView1<usize>,
+                x_indices: ArrayView1<usize>,
                 k: usize,
                 ef: usize,
-            ) -> PyResult<(Bound<'py, PyArray2<$t>>, Bound<'py, PyArray2<usize>>)> {
-                let xp = x_points.as_array();
-                let xi = x_indptr.as_array();
-                let xn = x_indices.as_array();
-
-                let (distances, indices) = py.detach(move || {
-                    let x = $nbhd::new(Cow::Owned($pack(xp)), xi, xn);
-                    let y = $nbhd::new(
-                        Cow::Borrowed(self.points_simd.as_slice()),
-                        ArrayView1::from(self.indptr.as_slice()),
-                        ArrayView1::from(self.indices.as_slice()),
-                    );
-                    $searchk(&x, &y, k, ef)
-                });
-
-                Ok((distances.into_pyarray(py), indices.into_pyarray(py)))
+            ) -> (Array2<$t>, Array2<usize>) {
+                let x = $nbhd::new(Cow::Owned($pack(x_points)), x_indptr, x_indices);
+                $searchk(&x, &self.as_graph(), k, ef)
             }
 
             /// Like `query`, but the query cloud is another prepared graph.
             /// Both operands are already SIMD-packed, so *nothing* is packed for
             /// this call (both views are `Cow::Borrowed`) -- this is the fast
             /// path for an all-by-all, where every graph is a persistent operand.
-            fn query_prepared<'py>(
-                &self,
-                py: Python<'py>,
-                other: PyRef<'py, $prepared>,
-            ) -> PyResult<(Bound<'py, PyArray1<$t>>, Bound<'py, PyArray1<usize>>)> {
-                let q: &$prepared = &other;
-                let (distances, indices) = py.detach(move || {
-                    let x = $nbhd::new(
-                        Cow::Borrowed(q.points_simd.as_slice()),
-                        ArrayView1::from(q.indptr.as_slice()),
-                        ArrayView1::from(q.indices.as_slice()),
-                    );
-                    let y = $nbhd::new(
-                        Cow::Borrowed(self.points_simd.as_slice()),
-                        ArrayView1::from(self.indptr.as_slice()),
-                        ArrayView1::from(self.indices.as_slice()),
-                    );
-                    $search(&x, &y)
-                });
-
-                Ok((distances.into_pyarray(py), indices.into_pyarray(py)))
+            pub fn query_prepared(&self, other: &Self) -> (Array1<$t>, Array1<usize>) {
+                $search(&other.as_graph(), &self.as_graph())
             }
 
             /// The k>1 variant of `query_prepared`.
-            fn query_prepared_k<'py>(
+            pub fn query_prepared_k(
                 &self,
-                py: Python<'py>,
-                other: PyRef<'py, $prepared>,
+                other: &Self,
                 k: usize,
                 ef: usize,
-            ) -> PyResult<(Bound<'py, PyArray2<$t>>, Bound<'py, PyArray2<usize>>)> {
-                let q: &$prepared = &other;
-                let (distances, indices) = py.detach(move || {
-                    let x = $nbhd::new(
-                        Cow::Borrowed(q.points_simd.as_slice()),
-                        ArrayView1::from(q.indptr.as_slice()),
-                        ArrayView1::from(q.indices.as_slice()),
-                    );
-                    let y = $nbhd::new(
-                        Cow::Borrowed(self.points_simd.as_slice()),
-                        ArrayView1::from(self.indptr.as_slice()),
-                        ArrayView1::from(self.indices.as_slice()),
-                    );
-                    $searchk(&x, &y, k, ef)
-                });
-
-                Ok((distances.into_pyarray(py), indices.into_pyarray(py)))
+            ) -> (Array2<$t>, Array2<usize>) {
+                $searchk(&other.as_graph(), &self.as_graph(), k, ef)
             }
 
             /// Number of points in the prepared target.
-            #[getter]
-            fn n(&self) -> usize {
+            pub fn n(&self) -> usize {
                 self.n
             }
 
             /// The target points as an `(n, 3)` array (pad lane dropped).
-            #[getter]
-            fn data<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<$t>> {
+            pub fn points(&self) -> Array2<$t> {
                 let mut arr = Array2::<$t>::zeros((self.n, 3));
                 for (i, p) in self.points_simd.iter().enumerate() {
                     let a = p.to_array();
@@ -510,22 +421,17 @@ macro_rules! impl_ann_for {
                     arr[[i, 1]] = a[1];
                     arr[[i, 2]] = a[2];
                 }
-                arr.into_pyarray(py)
-            }
-
-            fn __repr__(&self) -> String {
-                format!("{}(n={})", stringify!($prepared), self.n)
+                arr
             }
         }
     };
 }
 
-// f64 keeps the original `all_nearest_neighbours` name (backward compatible).
-impl_ann_for!(f64, f64x4, NeighboorhoodF64, euclidean_distance_f64, get_neighbours_f64, find_nn_f64, search_f64, all_nearest_neighbours,
-              HeapItemF64, find_knn_f64, search_k_f64, all_nearest_neighbours_k, pack_points_f64, PreparedF64);
+impl_ann_for!(f64, f64x4, NeighborhoodF64, euclidean_distance_f64, get_neighbours_f64, find_nn_f64, search_f64,
+              HeapItemF64, find_knn_f64, search_k_f64, pack_points_f64, PreparedF64);
 // f32 variant: half the memory traffic per point, some precision loss.
-impl_ann_for!(f32, f32x4, NeighboorhoodF32, euclidean_distance_f32, get_neighbours_f32, find_nn_f32, search_f32, all_nearest_neighbours_f32,
-              HeapItemF32, find_knn_f32, search_k_f32, all_nearest_neighbours_k_f32, pack_points_f32, PreparedF32);
+impl_ann_for!(f32, f32x4, NeighborhoodF32, euclidean_distance_f32, get_neighbours_f32, find_nn_f32, search_f32,
+              HeapItemF32, find_knn_f32, search_k_f32, pack_points_f32, PreparedF32);
 
 /// Build a vertex-adjacency CSR graph from Delaunay tetrahedra.
 ///
@@ -534,59 +440,147 @@ impl_ann_for!(f32, f32x4, NeighboorhoodF32, euclidean_distance_f32, get_neighbou
 /// `indices[indptr[v]..indptr[v + 1]]` -- the same layout scipy's
 /// `vertex_neighbor_vertices` produces, so it drops straight into the search.
 ///
-/// Runs with the GIL released, so builds can be parallelised from Python. Any
-/// vertex in `0..n_points` not referenced by a tetrahedron (e.g. an exact
+/// Any vertex in `0..n_points` not referenced by a tetrahedron (e.g. an exact
 /// duplicate point dropped by the triangulator) is left with no neighbours.
-#[pyfunction]
-fn graph_from_simplices<'py>(
-    py: Python<'py>,
-    simplices: PyReadonlyArray2<u64>,
+pub fn graph_from_simplices(
+    simplices: ArrayView2<u64>,
     n_points: usize,
-) -> PyResult<(Bound<'py, PyArray1<usize>>, Bound<'py, PyArray1<usize>>)> {
-    let s = simplices.as_array();
-
-    let (indptr, indices) = py.detach(move || {
-        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n_points];
-        for tet in s.outer_iter() {
-            let v = [
-                tet[0] as usize,
-                tet[1] as usize,
-                tet[2] as usize,
-                tet[3] as usize,
-            ];
-            for a in 0..4 {
-                for b in (a + 1)..4 {
-                    adj[v[a]].push(v[b]);
-                    adj[v[b]].push(v[a]);
-                }
+) -> (Array1<usize>, Array1<usize>) {
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n_points];
+    for tet in simplices.outer_iter() {
+        let v = [
+            tet[0] as usize,
+            tet[1] as usize,
+            tet[2] as usize,
+            tet[3] as usize,
+        ];
+        for a in 0..4 {
+            for b in (a + 1)..4 {
+                adj[v[a]].push(v[b]);
+                adj[v[b]].push(v[a]);
             }
         }
+    }
 
-        let mut indptr: Vec<usize> = Vec::with_capacity(n_points + 1);
-        indptr.push(0);
-        let mut indices: Vec<usize> = Vec::new();
-        for nb in adj.iter_mut() {
-            nb.sort_unstable();
-            nb.dedup();
-            indices.extend_from_slice(nb);
-            indptr.push(indices.len());
-        }
-        (Array1::from(indptr), Array1::from(indices))
-    });
-
-    Ok((indptr.into_pyarray(py), indices.into_pyarray(py)))
+    let mut indptr: Vec<usize> = Vec::with_capacity(n_points + 1);
+    indptr.push(0);
+    let mut indices: Vec<usize> = Vec::new();
+    for nb in adj.iter_mut() {
+        nb.sort_unstable();
+        nb.dedup();
+        indices.extend_from_slice(nb);
+        indptr.push(indices.len());
+    }
+    (Array1::from(indptr), Array1::from(indices))
 }
 
-/// A Python module implemented in Rust.
-#[pymodule]
-#[pyo3(name = "_aann")]
-fn aann(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(all_nearest_neighbours, m)?)?;
-    m.add_function(wrap_pyfunction!(all_nearest_neighbours_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(all_nearest_neighbours_k, m)?)?;
-    m.add_function(wrap_pyfunction!(all_nearest_neighbours_k_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(graph_from_simplices, m)?)?;
-    m.add_class::<PreparedF64>()?;
-    m.add_class::<PreparedF32>()?;
-    Ok(())
+#[cfg(feature = "python")]
+mod python;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    /// The 4 corners of the unit tetrahedron plus their fully-connected CSR
+    /// graph (from the single Delaunay simplex covering all of them).
+    fn tetrahedron() -> (Array2<f64>, Array1<usize>, Array1<usize>) {
+        let points = array![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0]
+        ];
+        let (indptr, indices) = graph_from_simplices(array![[0u64, 1, 2, 3]].view(), 4);
+        (points, indptr, indices)
+    }
+
+    #[test]
+    fn csr_from_simplices() {
+        let (_, indptr, indices) = tetrahedron();
+        // Fully connected: every vertex has the other 3 as sorted neighbours.
+        assert_eq!(indptr.to_vec(), vec![0, 3, 6, 9, 12]);
+        assert_eq!(
+            indices.to_vec(),
+            vec![1, 2, 3, 0, 2, 3, 0, 1, 3, 0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn one_nn_unit_tetrahedron() {
+        let (points, indptr, indices) = tetrahedron();
+        // Queries: each corner nudged +0.01 in x, sharing the same CSR graph.
+        let mut queries = points.clone();
+        for mut row in queries.outer_iter_mut() {
+            row[0] += 0.01;
+        }
+
+        let x = NeighborhoodF64::new(
+            Cow::Owned(pack_points_f64(queries.view())),
+            indptr.view(),
+            indices.view(),
+        );
+        let y = NeighborhoodF64::new(
+            Cow::Owned(pack_points_f64(points.view())),
+            indptr.view(),
+            indices.view(),
+        );
+        let (dists, idxs) = search_f64(&x, &y);
+        assert_eq!(idxs.to_vec(), vec![0, 1, 2, 3]);
+        for d in dists.iter() {
+            assert!((d - 0.01).abs() < 1e-12);
+        }
+
+        // Same result through the owned/prepared API.
+        let target = PreparedF64::new(points.view(), indptr.view(), indices.view());
+        assert_eq!(target.n(), 4);
+        let (dists2, idxs2) = target.query(queries.view(), indptr.view(), indices.view());
+        assert_eq!(idxs2.to_vec(), idxs.to_vec());
+        assert_eq!(dists2.to_vec(), dists.to_vec());
+
+        // And prepared-vs-prepared (the pack-free path).
+        let qprep = PreparedF64::new(queries.view(), indptr.view(), indices.view());
+        let (dists3, idxs3) = target.query_prepared(&qprep);
+        assert_eq!(idxs3.to_vec(), idxs.to_vec());
+        assert_eq!(dists3.to_vec(), dists.to_vec());
+    }
+
+    #[test]
+    fn knn_sorted_and_padded() {
+        let (points, indptr, indices) = tetrahedron();
+        let query = array![[0.01, 0.0, 0.0]];
+        // Single query point: trivial one-vertex graph with no neighbours.
+        let (qptr, qidx) = (array![0usize, 0], Array1::<usize>::zeros(0));
+
+        let target = PreparedF64::new(points.view(), indptr.view(), indices.view());
+        let (dists, idxs) = target.query_k(query.view(), qptr.view(), qidx.view(), 2, 4);
+        // Nearest = corner 0 (d=0.01), second = corner 1 (d=0.99), ascending.
+        assert_eq!(idxs.row(0).to_vec(), vec![0, 1]);
+        assert!((dists[[0, 0]] - 0.01).abs() < 1e-12);
+        assert!((dists[[0, 1]] - 0.99).abs() < 1e-12);
+        assert!(dists[[0, 0]] < dists[[0, 1]]);
+
+        // k > |y|: missing entries are (inf, |y|)-padded.
+        let (dists, idxs) = target.query_k(query.view(), qptr.view(), qidx.view(), 6, 8);
+        assert_eq!(idxs.row(0).to_vec(), vec![0, 1, 2, 3, 4, 4]);
+        assert!(dists[[0, 4]].is_infinite() && dists[[0, 5]].is_infinite());
+    }
+
+    #[test]
+    fn f32_instantiation_matches() {
+        let (points, indptr, indices) = tetrahedron();
+        let points = points.mapv(|v| v as f32);
+        let mut queries = points.clone();
+        for mut row in queries.outer_iter_mut() {
+            row[0] += 0.01;
+        }
+
+        let target = PreparedF32::new(points.view(), indptr.view(), indices.view());
+        let qprep = PreparedF32::new(queries.view(), indptr.view(), indices.view());
+        let (dists, idxs) = target.query_prepared(&qprep);
+        assert_eq!(idxs.to_vec(), vec![0, 1, 2, 3]);
+        for d in dists.iter() {
+            assert!((d - 0.01).abs() < 1e-6);
+        }
+    }
 }

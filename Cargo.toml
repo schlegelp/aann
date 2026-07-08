@@ -2,21 +2,42 @@
 name = "aann"
 version = "0.1.0"
 edition = "2021"
+description = "Approximate all-nearest-neighbour search over neighbourhood graphs, SIMD-accelerated, with optional Python bindings."
+license = "GPL-3.0-or-later"
+repository = "https://github.com/schlegelp/aann"
+homepage = "https://github.com/schlegelp/aann"
+readme = "README.md"
+keywords = ["nearest-neighbor", "ann", "delaunay", "spatial", "graph"]
+categories = ["algorithms", "science", "mathematics", "data-structures"]
+exclude = [
+    "*.ipynb",
+    "profile.svg",
+    "_static/",
+    "arena/",
+    ".github/",
+]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
 name = "aann"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Enables the PyO3 extension module (what maturin builds); without it the
+# crate is a pure-Rust library.
+python = ["dep:pyo3", "dep:numpy"]
 
 [dependencies]
 ndarray = { version = "0.17", features = ["rayon"] }
-numpy = "0.29"
+numpy = { version = "0.29", optional = true }
 rayon = "1.8.0"
 
 [dependencies.pyo3]
 version = "0.29.0"
 # "abi3-py310" tells pyo3 (and maturin) to build using the stable ABI with minimum Python version 3.10
 features = ["abi3-py310"]
+optional = true
 
 [profile.release]
 codegen-units = 1

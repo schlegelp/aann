@@ -19,6 +19,25 @@ permissions:
   contents: read
 
 jobs:
+  # Not maturin-generated: proves the crate works as a plain Rust library
+  # (default features = no pyo3/numpy) and stays publishable to crates.io.
+  # rustup picks up the nightly toolchain from rust-toolchain.toml.
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6 # insurance for pyo3's build-script probe
+        with:
+          python-version: "3.12"
+      - name: Build core (no features)
+        run: cargo build --locked
+      - name: Test core
+        run: cargo test --locked
+      - name: Check Python bindings compile
+        run: cargo check --locked --features python
+      - name: Publish dry run
+        run: cargo publish --dry-run --locked
+
   linux:
     runs-on: ${{ matrix.platform.runner }}
     strategy:

@@ -55,5 +55,6 @@ Issues = "https://github.com/schlegelp/aann/issues"
 
 [tool.maturin]
 module-name = "aann._aann"
-# "extension-module" tells pyo3 we want to build an extension module (skips linking against libpython.so)
-features = ["pyo3/extension-module"]
+# "python" enables the (non-default) PyO3 bindings; "extension-module" tells
+# pyo3 we want to build an extension module (skips linking against libpython.so)
+features = ["python", "pyo3/extension-module"]

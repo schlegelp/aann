@@ -91,6 +91,38 @@ query near the previous answer. That is what makes it fast on coherent clouds
 scattered points, and expect *approximate* results for `k>1` (`k=1` is exact on a
 Delaunay graph).
 
+## Using from Rust
+
+The core search is a plain Rust library — the Python bindings sit behind the
+non-default `python` cargo feature. It requires a **nightly** toolchain
+(`portable_simd`), so add a `rust-toolchain.toml` with `channel = "nightly"` to
+your project, then:
+
+```toml
+[dependencies]
+aann = { git = "https://github.com/schlegelp/aann" }
+```
+
+```rust
+use aann::{graph_from_simplices, PreparedF64};
+use aann::ndarray::array; // re-exported ndarray
+
+// Target cloud + its Delaunay simplices (rows of 4 vertex ids):
+let points = array![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+let (indptr, indices) = graph_from_simplices(array![[0u64, 1, 2, 3]].view(), 4);
+let target = PreparedF64::new(points.view(), indptr.view(), indices.view());
+
+// Query cloud with its own CSR neighbourhood graph:
+let queries = array![[0.1, 0.0, 0.0], [0.9, 0.1, 0.0]];
+let (qptr, qidx) = (array![0usize, 1, 2], array![1usize, 0]);
+let (dists, idxs) = target.query(queries.view(), qptr.view(), qidx.view());
+```
+
+`PreparedF64::query_k(..., k, ef)` gives k nearest neighbours,
+`query_prepared(&other)` is the pack-free prepared-vs-prepared fast path, and
+everything exists in an `F32` flavour too (see the crate docs for the full
+API, including the lower-level `Neighborhood*`/`search_*` functions).
+
 ## Benchmark
 
 `bench.py` contrasts `aann` with `scipy.spatial.KDTree` on uniform random 3D
