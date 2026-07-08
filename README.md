@@ -1,43 +1,122 @@
-# [WIP] aann
-**A**pproximate **a**ll **n**earest-**n**eighbor ("_aann_") search using neighborhood graphs. Implemented in Rust with Python bindings.
+# `AANN`
+**A**pproximate **A**ll **N**earest-**N**eighbor ("_aann_") search using neighborhood graphs. Implemented in Rust with Python bindings Based on [Soudani & Karami (2018)](https://arxiv.org/abs/1802.09594).
 
-Based on the paper ALL NEAREST NEIGHBOUR CALCULATION BASED ON
-DELAUNAY GRAPHS, Soudani & Karami, 2018 (arXiv)
-([link](https://arxiv.org/abs/1802.09594)).
+It is optimised for **many nearest-neighbour joins that reuse the same clouds** —
+build each cloud's index once, then query it again and again (e.g. an all-by-all
+join). See [Usage](#usage).
 
 ### Problem
 
 Given two point clouds `Q` and `P`, for each point `q` in `Q` find its nearest neighbor `p` among the points in `P`.
 
 ### Solution
-1. Calculate Delaunay graphs for both point clouds.
+1. Calculate neighborhood (e.g. Delaunay) graphs for both point clouds.
 2. Start with a random vertex `q` in `Q` and traverse `P` using an A* search to find its nearest neighbor `p`.
 3. Move to a vertex adjacent to `q` and search `P` for its nearest neighbor using `p` as the start. Since we start the search where we have already established spatial proximity the A* search should finish quickly.
 4. Rinse-repeat until we found nearest neighbors for all points in `Q`.
 
-## TODOs
-- [ ] generalize to N-dimensions (currently only 3D)
-- [ ] implement k-nearest neighbors (currently only 1)
-- [ ] use SIMD (singe instruction multiple data) for distance calculations
-- [ ] test various neighborhood graphs
-- [ ] see if we can immplement additional parameters (e.g. `distance_upper_bound` or maybe a `distance_lower_bound` if that's useful)
-- [ ] implement alternative distance metrics (currently only Euclidean)
-- [ ] benchmarks
+![schematic](./_static/aann_schematic.png)
+
+### Limitations
+We currently only support 3D point clouds and Euclidean distances but may extend this to N-dimensions and other metrics in the future.
 
 ## Usage
+
+`aann` is built for **repeated** nearest-neighbour queries against prepared
+indices. Building an `AANN` index does the expensive work up front — triangulate
+the cloud into a neighbourhood graph, SIMD-pack its coordinates, and (by default)
+reorder them for cache locality — so that every subsequent `.query` is cheap. The
+payoff grows the more you reuse an index; for a single one-off search the build
+cost dominates and a plain KD-tree is simpler.
+
+### Build an index once, query it many times
 
 ```python
 import aann
 import numpy as np
 
-N = 10000
-x = Delaunay(np.random.rand(N, 3))
-y = Delaunay(np.random.rand(N, 3))
+target = np.random.rand(10_000, 3)
+index = aann.AANN(target)              # pay the build cost once...
 
-distances, indices = aann.all_nearest_neighbours(x, y)
+for query in query_clouds:             # ...then amortise it over many queries
+    distances, indices = index.query(query)
+
+# k nearest neighbours per point -> (N, k) arrays, rows sorted by distance
+# (k>1 is approximate; raise `ef` to trade search breadth for recall):
+distances, indices = index.query(query, k=4)
+
+# Ignore matches beyond a cutoff (scipy convention: misses get
+# distance=inf and neighbour index=len(target)):
+distances, indices = index.query(query, distance_upper_bound=0.05)
 ```
 
+The query cloud can be a raw `(N, 3)` array, a `scipy`/`shull` `Delaunay`, or
+another `AANN` — passing a prepared `AANN` skips re-triangulating it (the fast
+path the all-by-all below uses). `k` counts *returned* neighbours (as in
+`scipy.spatial.cKDTree.query`); the degree of the optional `graph="knn"`
+neighbourhood graph is `graph_k`.
+
+### All-by-all: every cloud against every other
+
+This is where `aann` pulls ahead. Build one index per cloud with `prepare_many`
+(parallel), then join them with `all_by_all`: every index is built and packed
+**once** and reused across every pair it appears in, and the Rust search releases
+the GIL so the pairs run concurrently across cores.
+
+```python
+indexes = aann.prepare_many(clouds)                 # list[AANN], built in parallel
+results = aann.all_by_all(indexes)                  # every ordered i != j pair
+results = aann.all_by_all(indexes, pairs=[(0, 1)])  # ...or a specific subset
+# results[m] is the (distances, indices) for pairs[m] (query = i, target = j)
+```
+
+Because a cloud that appears in many pairs is triangulated and packed only once,
+a full all-by-all over *n* clouds does *O(n)* index builds rather than *O(n²)* —
+the reason `aann` suits workloads like NBLAST neuron-vs-neuron matrices.
+
+### `aann` vs a KD-tree
+
+Unlike a KD-tree, `aann` is a **cloud-vs-cloud** method: the query points are
+themselves triangulated into a graph, so the warm-started descent starts each
+query near the previous answer. That is what makes it fast on coherent clouds
+(neurons, meshes, space-filling data) — but pass a whole cloud, not a handful of
+scattered points, and expect *approximate* results for `k>1` (`k=1` is exact on a
+Delaunay graph).
+
+## Benchmark
+
+`bench.py` contrasts `aann` with `scipy.spatial.KDTree` on uniform random 3D
+clouds, single-threaded (so it compares the algorithms, not the thread pools).
+It makes the trade-off concrete — an `aann` index is expensive to build but cheap
+to query, so it only pays off once reused. Representative run (N = 5000
+points/cloud, float64; numbers are indicative and machine-dependent):
+
+|              | build  | query  |
+| ------------ | ------ | ------ |
+| scipy KDTree | 0.6 ms | 2.5 ms |
+| aann index   | 19 ms  | 0.5 ms |
+
+The index costs ~30× more to build but answers each query ~5× faster, so it
+breaks even after ~9 reuses. In a full all-by-all — where every cloud's index is
+built once and reused across all its pairs — `aann`'s **total** wall-clock
+(build + every pair) overtakes `scipy` at roughly a dozen clouds and keeps
+pulling ahead (≈1.6× faster at n = 20). Recall vs the exact KDTree is 100% on
+this uniform data. Reproduce with `python bench.py`.
+
+## TODOs
+- [x] use SIMD (singe instruction multiple data) for distance calculations
+- [x] implement k-all-nearest neighbors (`k>1` uses an approximate best-first search; recall tunable via `ef`)
+- [x] benchmarks
+- [/] test various neighborhood graphs
+- [/] see if we can immplement additional parameters (done: `distance_upper_bound`; maybe a `distance_lower_bound` if that's useful)
+- [] implement `query_radius` (analagous to `scipy.spatial.cKDTree.query_ball_tree`)
+- [ ] implement alternative distance metrics (currently only Euclidean)
+- [ ] generalize to N-dimensions (currently only 3D)
+
 ## Build
+Requires **Python ≥ 3.10**. The extension is built against the stable ABI
+(`abi3-py310`), so a single wheel works across all supported CPython versions.
+
 1. `cd` into directory
 2. Activate virtual environment: `source .venv/bin/activate`
 3. Run `maturin build --release` to build a wheel or use `maturin develop` to compile and install in development mode
@@ -87,4 +166,9 @@ pytest --verbose -s
 
 Note that unless you compiled with `maturin develop --release` the timings will
 be much slower (up to 10x) than in a release build.
+
+
+## References
+
+Soudani, N. M., & Karami, A. (2018). All nearest neighbor calculation based on Delaunay graphs (Version 1). arXiv. https://doi.org/10.48550/ARXIV.1802.09594
 

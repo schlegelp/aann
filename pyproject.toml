@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "aann"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
@@ -13,7 +13,8 @@ classifiers = [
 dynamic = ["version"]
 dependencies = [
     "numpy>=1.21.0",
-    "scipy>=1.0.0"
+    "scipy>=1.0.0",
+    "shull>=0.2.0"
 ]
 
 [tool.maturin]
