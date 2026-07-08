@@ -1,5 +1,5 @@
 # `AANN`
-**A**pproximate **A**ll **N**earest-**N**eighbor ("_aann_") search using neighborhood graphs. Implemented in Rust with Python bindings Based on [Soudani & Karami (2018)](https://arxiv.org/abs/1802.09594).
+**A**pproximate **A**ll **N**earest-**N**eighbor ("_aann_") search using neighborhood graphs. Implemented in Rust with Python bindings. Based on [Soudani & Karami (2018)](https://arxiv.org/abs/1802.09594).
 
 It is optimised for **many nearest-neighbour joins that reuse the same clouds** —
 build each cloud's index once, then query it again and again (e.g. an all-by-all
@@ -19,6 +19,14 @@ Given two point clouds `Q` and `P`, for each point `q` in `Q` find its nearest n
 
 ### Limitations
 We currently only support 3D point clouds and Euclidean distances but may extend this to N-dimensions and other metrics in the future.
+
+## Install
+
+We provide prebuilt wheels for Linux, macOS, and Windows on PyPI:
+
+```bash
+pip install aann
+```
 
 ## Usage
 
@@ -107,9 +115,9 @@ this uniform data. Reproduce with `python bench.py`.
 - [x] use SIMD (singe instruction multiple data) for distance calculations
 - [x] implement k-all-nearest neighbors (`k>1` uses an approximate best-first search; recall tunable via `ef`)
 - [x] benchmarks
-- [/] test various neighborhood graphs
-- [/] see if we can immplement additional parameters (done: `distance_upper_bound`; maybe a `distance_lower_bound` if that's useful)
-- [] implement `query_radius` (analagous to `scipy.spatial.cKDTree.query_ball_tree`)
+- [-] test various neighborhood graphs
+- [-] see if we can immplement additional parameters (done: `distance_upper_bound`; maybe a `distance_lower_bound` if that's useful)
+- [ ] implement `query_radius` (analagous to `scipy.spatial.cKDTree.query_ball_tree`)
 - [ ] implement alternative distance metrics (currently only Euclidean)
 - [ ] generalize to N-dimensions (currently only 3D)
 
