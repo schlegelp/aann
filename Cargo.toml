@@ -29,9 +29,8 @@ default = []
 python = ["dep:pyo3", "dep:numpy"]
 
 [dependencies]
-ndarray = { version = "0.17", features = ["rayon"] }
+ndarray = "0.17"
 numpy = { version = "0.29", optional = true }
-rayon = "1.8.0"
 
 [dependencies.pyo3]
 version = "0.29.0"
