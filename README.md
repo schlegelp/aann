@@ -100,8 +100,12 @@ your project, then:
 
 ```toml
 [dependencies]
-aann = { git = "https://github.com/schlegelp/aann" }
+aann-graph = { git = "https://github.com/schlegelp/aann" }
 ```
+
+The package is named `aann-graph` (plain `aann` is taken on crates.io by an
+unrelated project) but its library target is `aann`, so in code you import it
+as `aann`:
 
 ```rust
 use aann::{graph_from_simplices, PreparedF64};

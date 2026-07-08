@@ -1,5 +1,7 @@
 [package]
-name = "aann"
+# "aann" is taken on crates.io by an unrelated project; the lib target below
+# keeps the name "aann", so Rust code still says `use aann::...`.
+name = "aann-graph"
 version = "0.1.0"
 edition = "2021"
 description = "Approximate all-nearest-neighbour search over neighbourhood graphs, SIMD-accelerated, with optional Python bindings."
