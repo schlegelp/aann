@@ -219,9 +219,7 @@ class AANN:
                 d, i = self._rust.query_k(gx.points, gx.indptr, gx.indices, k, ef_eff, ub)
             gx_perm = gx.perm
 
-        return _finalize_results(
-            d, i, gx_perm, self._perm, self.n, k, distance_upper_bound
-        )
+        return _finalize_results(d, i, gx_perm, self._perm, self.n)
 
     @property
     def data(self):
@@ -388,18 +386,18 @@ def _effective_ef(ef, k, n_y):
     return max(1, min(max(int(ef), k), n_y))
 
 
-def _finalize_results(d, i, gx_perm, gy_perm, n_y, k, distance_upper_bound):
-    """Map raw Rust search output back to the caller's point order and apply
-    the distance cutoff. Shared by every :meth:`AANN.query` path so the (fiddly)
-    marker-safe permutation handling lives once.
+def _finalize_results(d, i, gx_perm, gy_perm, n_y):
+    """Map raw Rust search output back to the caller's point order.
 
-    ``gx_perm`` / ``gy_perm`` are the query/target Morton permutations (or
-    ``None``); ``n_y`` is the target point count (the missing-neighbour marker).
+    Rust already applies ``distance_upper_bound`` -- out-of-range results carry
+    the miss marker ``(inf, n_y)`` -- so this only undoes the Morton reorders
+    (marker-safely). ``gx_perm`` / ``gy_perm`` are the query/target permutations
+    (or ``None``); ``n_y`` is the target point count / missing-neighbour marker.
     """
     # Undo a target reorder so indices refer to y's original order. Extend the
     # permutation with the miss marker (index n_y) mapping to itself: k>1 rows
-    # carry it as padding, and a bounded k=1 search now emits it too, so the
-    # lookup must stay in bounds for both.
+    # carry it as padding, and a bounded k=1 search emits it too, so the lookup
+    # must stay in bounds for both.
     if gy_perm is not None:
         perm_ext = np.append(gy_perm, n_y)
         i = perm_ext[i]
@@ -410,14 +408,6 @@ def _finalize_results(d, i, gx_perm, gy_perm, n_y, k, distance_upper_bound):
         d_out[gx_perm] = d  # query results -> x's original order
         i_out[gx_perm] = i
         d, i = d_out, i_out
-
-    # Applied after the perm remap so the missing marker (an out-of-range
-    # index, matching scipy's convention) never flows through the fancy
-    # indexing above. The descent itself cannot use the bound -- see docstring.
-    if distance_upper_bound is not None and distance_upper_bound < np.inf:
-        miss = d > distance_upper_bound
-        d[miss] = np.inf
-        i[miss] = n_y
 
     return d, i
 

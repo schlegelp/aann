@@ -118,11 +118,12 @@ impl Default for Workspace {
 ///  `$box_dist2` generated point-to-box squared-distance helper name
 ///  `$box_box_dist2` generated box-to-box squared-min-distance helper name
 ///  `$bbox_of`  generated point-cloud bounding-box helper name
+///  `$resolve_prune` generated bound-resolution helper name
 ///  `$search_pruned` generated allocating bound-aware k=1 search name
 macro_rules! impl_ann_for {
     ($t:ty, $simd:ty, $nbhd:ident, $dist:ident, $neigh:ident, $find:ident, $search:ident,
      $search_into:ident, $hitem:ident, $findk:ident, $searchk:ident, $pack:ident, $prepared:ident,
-     $box_dist2:ident, $box_box_dist2:ident, $bbox_of:ident, $search_pruned:ident) => {
+     $box_dist2:ident, $box_box_dist2:ident, $bbox_of:ident, $resolve_prune:ident, $search_pruned:ident) => {
         /// A neighborhood graph over `$t` coordinates.
         ///
         /// `indices`/`neighbors` are zero-copy CSR views into the caller's
@@ -209,6 +210,43 @@ macro_rules! impl_ann_for {
             (mn, mx)
         }
 
+        /// Resolve a `distance_upper_bound` request into what the search walk
+        /// needs, doing the geometry once per call. `prune` is
+        /// `(target_min, target_max, bound, query_box?)`; the query box is passed
+        /// in for prepared operands (so an all-by-all never re-folds it) and
+        /// folded from `xpts` otherwise. Returns:
+        ///  - `None`: no bound in effect.
+        ///  - `Some(None)`: the whole query cloud is out of range -> all misses.
+        ///  - `Some(Some((min, max, ub2, check_points)))`: the target box, the
+        ///    squared bound, and whether the per-point box test can ever fire.
+        ///    `check_points` is false when the query cloud sits within the target
+        ///    box grown by the bound (e.g. two overlapping clouds): no point can
+        ///    be ruled out by the box, so the walk skips that test and relies on
+        ///    marking neighbours that come back beyond the bound.
+        #[inline]
+        fn $resolve_prune(
+            prune: Option<($simd, $simd, $t, Option<($simd, $simd)>)>,
+            xpts: &[$simd],
+            n_x: usize,
+        ) -> Option<Option<($simd, $simd, $t, bool)>> {
+            let (tmin, tmax, u, qbox) = prune?;
+            if n_x == 0 {
+                return Some(None); // nothing to search
+            }
+            let ub2 = u * u;
+            let (qmin, qmax) = match qbox {
+                Some(b) => b,
+                None => $bbox_of(xpts),
+            };
+            if $box_box_dist2(&qmin, &qmax, &tmin, &tmax) > ub2 {
+                return Some(None); // whole cloud out of range
+            }
+            let (qmn, qmx) = (qmin.to_array(), qmax.to_array());
+            let (tmn, tmx) = (tmin.to_array(), tmax.to_array());
+            let check_points = (0..3).any(|a| qmn[a] < tmn[a] - u || qmx[a] > tmx[a] + u);
+            Some(Some((tmin, tmax, ub2, check_points)))
+        }
+
         /// Neighbour indices of `vertex`, as a zero-copy slice.
         #[inline(always)]
         fn $neigh<'a>(x: &$nbhd<'a>, vertex: usize) -> ArrayView1<'a, usize> {
@@ -261,7 +299,7 @@ macro_rules! impl_ann_for {
             ws: &mut Workspace,
             dists: &mut Vec<$t>,
             idx: &mut Vec<usize>,
-            prune: Option<($simd, $simd, $t)>,
+            prune: Option<($simd, $simd, $t, Option<($simd, $simd)>)>,
         ) {
             let n_x = x.indices.len() - 1;
             let n_y = y.points_simd.len();
@@ -273,24 +311,19 @@ macro_rules! impl_ann_for {
 
             let xpts: &[$simd] = &x.points_simd;
 
-            // `distance_upper_bound` handling (see `$prepared::query`). `prune`
-            // carries the target's bounding box and the raw bound; we work in
-            // squared distance (`ub2`) to match the descent. A point/box beyond
-            // the bound reports the miss marker (inf, |y|) -- scipy's convention.
-            let prune2 = prune.map(|(bmin, bmax, u)| (bmin, bmax, u * u));
-            if let Some((bmin, bmax, ub2)) = prune2 {
-                // Box-to-box short-circuit: if the whole query cloud is farther
-                // from the target's box than the bound, every point is a miss --
-                // skip the descent entirely (the big win for separated clouds).
-                if n_x > 0 {
-                    let (xmin, xmax) = $bbox_of(xpts);
-                    if $box_box_dist2(&xmin, &xmax, &bmin, &bmax) > ub2 {
-                        dists.iter_mut().for_each(|d| *d = <$t>::INFINITY);
-                        idx.iter_mut().for_each(|i| *i = n_y);
-                        return;
-                    }
+            // Resolve `distance_upper_bound` into what the walk needs: the squared
+            // bound plus `check_points` (whether the per-point box test can fire).
+            // A wholly out-of-range cloud is reported as all-misses here without
+            // touching the descent. `prune2 = (bmin, bmax, ub2, check_points)`.
+            let prune2 = match $resolve_prune(prune, xpts, n_x) {
+                None => None,
+                Some(None) => {
+                    dists.iter_mut().for_each(|d| *d = <$t>::INFINITY);
+                    idx.iter_mut().for_each(|i| *i = n_y);
+                    return;
                 }
-            }
+                Some(Some(p)) => Some(p),
+            };
 
             // Depth-first walk of `x`'s graph, each query warm-starting from the
             // previous nearest neighbour. Stack holds (start-in-y, vertex-in-x).
@@ -307,43 +340,78 @@ macro_rules! impl_ann_for {
             let xindptr: &[usize] = x.indices.as_slice().expect("contiguous CSR indptr");
             let xneigh: &[usize] = x.neighbors.as_slice().expect("contiguous CSR neighbours");
 
-            for root in 0..n_x {
-                if visited[root] == gen {
-                    continue;
-                }
-                visited[root] = gen;
-                stack.push((seed, root));
+            // Two monomorphic walks so the common (unbounded / no-box-prune) path
+            // carries zero per-point bound code -- the descent is only a few hops
+            // on a warm cloud, so a per-point branch would be a large relative
+            // cost. Only the straddle case (`check_points`) pays the inline box
+            // test, which earns its keep by skipping whole descents.
+            match prune2 {
+                Some((bmin, bmax, ub2, true)) => {
+                    for root in 0..n_x {
+                        if visited[root] == gen {
+                            continue;
+                        }
+                        visited[root] = gen;
+                        stack.push((seed, root));
 
-                while let Some((start, v)) = stack.pop() {
-                    // Prune: skip the descent when `v` is beyond the bound from
-                    // the whole target box, and mark it a miss when its found
-                    // neighbour is still too far. A miss keeps `seed` unchanged
-                    // and seeds children from the incoming `start`, so the warm
-                    // start survives a run of pruned points.
-                    let (d, ix) = match prune2 {
-                        Some((ref bmin, ref bmax, ub2)) => {
-                            if $box_dist2(bmin, bmax, &xpts[v]) > ub2 {
+                        while let Some((start, v)) = stack.pop() {
+                            // Skip the descent for a point beyond the bound from
+                            // the whole target box; mark its neighbour a miss if
+                            // it still comes back too far. A miss keeps `seed` and
+                            // seeds children from `start`, so the warm start
+                            // survives a run of pruned points.
+                            let (d, ix) = if $box_dist2(&bmin, &bmax, &xpts[v]) > ub2 {
                                 (<$t>::INFINITY, n_y)
                             } else {
                                 let (d, ix) = $find(y, &xpts[v], start);
                                 if d * d > ub2 { (<$t>::INFINITY, n_y) } else { (d, ix) }
+                            };
+                            dists[v] = d;
+                            idx[v] = ix;
+                            let child_start = if ix == n_y { start } else { seed = ix; ix };
+
+                            for &m in &xneigh[xindptr[v]..xindptr[v + 1]] {
+                                if visited[m] != gen {
+                                    visited[m] = gen;
+                                    stack.push((child_start, m));
+                                }
                             }
                         }
-                        None => $find(y, &xpts[v], start),
-                    };
-                    dists[v] = d;
-                    idx[v] = ix;
-                    let child_start = if ix == n_y {
-                        start
-                    } else {
-                        seed = ix;
-                        ix
-                    };
+                    }
+                }
+                _ => {
+                    // Plain unbounded descent (identical to the no-bound case).
+                    for root in 0..n_x {
+                        if visited[root] == gen {
+                            continue;
+                        }
+                        visited[root] = gen;
+                        stack.push((seed, root));
 
-                    for &m in &xneigh[xindptr[v]..xindptr[v + 1]] {
-                        if visited[m] != gen {
-                            visited[m] = gen;
-                            stack.push((child_start, m));
+                        while let Some((start, v)) = stack.pop() {
+                            let (d, ix) = $find(y, &xpts[v], start);
+                            dists[v] = d;
+                            idx[v] = ix;
+                            seed = ix;
+
+                            for &m in &xneigh[xindptr[v]..xindptr[v + 1]] {
+                                if visited[m] != gen {
+                                    visited[m] = gen;
+                                    stack.push((ix, m));
+                                }
+                            }
+                        }
+                    }
+                    // check_points == false: nothing could be box-pruned, so the
+                    // walk ran unbounded; mark neighbours beyond the bound in one
+                    // cheap linear pass (sequential and branch-predictable, far
+                    // cheaper than a test inside the pointer-chasing descent).
+                    if let Some((_, _, ub2, false)) = prune2 {
+                        for v in 0..n_x {
+                            if dists[v] * dists[v] > ub2 {
+                                dists[v] = <$t>::INFINITY;
+                                idx[v] = n_y;
+                            }
                         }
                     }
                 }
@@ -359,14 +427,15 @@ macro_rules! impl_ann_for {
             $search_pruned(x, y, None)
         }
 
-        /// Bound-aware `$search`: `prune = Some((box_min, box_max, ub))` reports
-        /// the miss marker (inf, |y|) for every query point with no `y` neighbour
-        /// within `ub`, using the target box to skip the descent where it
-        /// provably can't help (see `$search_into`). `None` is plain `$search`.
+        /// Bound-aware `$search`: `prune = Some((target_min, target_max, ub,
+        /// query_box?))` reports the miss marker (inf, |y|) for every query point
+        /// with no `y` neighbour within `ub`, using the target box to skip the
+        /// descent where it provably can't help (see `$search_into` /
+        /// `$resolve_prune`). `None` is plain `$search`.
         pub fn $search_pruned(
             x: &$nbhd,
             y: &$nbhd,
-            prune: Option<($simd, $simd, $t)>,
+            prune: Option<($simd, $simd, $t, Option<($simd, $simd)>)>,
         ) -> (Array1<$t>, Array1<usize>) {
             let n_x = x.indices.len() - 1;
             let mut ws = Workspace::with_capacity(n_x);
@@ -465,26 +534,22 @@ macro_rules! impl_ann_for {
             y: &$nbhd,
             k: usize,
             ef: usize,
-            prune: Option<($simd, $simd, $t)>,
+            prune: Option<($simd, $simd, $t, Option<($simd, $simd)>)>,
         ) -> (Array2<$t>, Array2<usize>) {
             let n_x = x.indices.len() - 1;
             let n_y = y.points_simd.len();
             let mut distances = Array2::<$t>::from_elem((n_x, k), <$t>::INFINITY);
             let mut indices = Array2::<usize>::from_elem((n_x, k), n_y);
 
-            // `distance_upper_bound` (see `$search_into`): squared bound + target
-            // box. Rows already hold the miss marker (inf, |y|), so pruning just
-            // leaves them untouched. Heap items carry *squared* distances, so we
-            // compare against `ub2` directly and only `sqrt` the ones we keep.
-            let prune2 = prune.map(|(bmin, bmax, u)| (bmin, bmax, u * u));
-            if let Some((bmin, bmax, ub2)) = prune2 {
-                if n_x > 0 {
-                    let (xmin, xmax) = $bbox_of(&x.points_simd);
-                    if $box_box_dist2(&xmin, &xmax, &bmin, &bmax) > ub2 {
-                        return (distances, indices); // whole cloud out of range
-                    }
-                }
-            }
+            // `distance_upper_bound` (see `$search_into` / `$resolve_prune`).
+            // Rows already hold the miss marker (inf, |y|), so pruning leaves them
+            // untouched. Heap items carry *squared* distances, so we compare
+            // against `ub2` directly and only `sqrt` the ones we keep.
+            let prune2 = match $resolve_prune(prune, &x.points_simd, n_x) {
+                None => None,
+                Some(None) => return (distances, indices), // whole cloud out of range
+                Some(Some(p)) => Some(p),
+            };
 
             // Per-search scratch, reused across all queries.
             let mut visited: Vec<u32> = vec![0; n_y];
@@ -506,10 +571,11 @@ macro_rules! impl_ann_for {
                 stack.push((seed, root));
 
                 while let Some((start, v)) = stack.pop() {
-                    // Whole target box beyond the bound: leave the row a miss and
-                    // keep the warm `seed` (do not advance it off a pruned point).
-                    if let Some((bmin, bmax, ub2)) = prune2 {
-                        if $box_dist2(&bmin, &bmax, &x.points_simd[v]) > ub2 {
+                    // Whole target box beyond the bound (only possible when
+                    // `check_points`): leave the row a miss and keep the warm
+                    // `seed` (do not advance it off a pruned point).
+                    if let Some((bmin, bmax, ub2, check_points)) = prune2 {
+                        if check_points && $box_dist2(&bmin, &bmax, &x.points_simd[v]) > ub2 {
                             for n2 in $neigh(x, v) {
                                 let m = *n2;
                                 if !visited_x[m] {
@@ -531,7 +597,7 @@ macro_rules! impl_ann_for {
                     for (j, item) in res.iter().take(k).enumerate() {
                         // Results are ascending, so once one exceeds the bound the
                         // rest do too -- leave those slots as the (inf, |y|) marker.
-                        if let Some((_, _, ub2)) = prune2 {
+                        if let Some((_, _, ub2, _)) = prune2 {
                             if item.d > ub2 {
                                 break;
                             }
@@ -607,11 +673,17 @@ macro_rules! impl_ann_for {
                 }
             }
 
-            /// Build the pruning tuple for a bounded search: the target box plus
-            /// the raw `distance_upper_bound`, or `None` for an unbounded search.
+            /// Build the pruning tuple for a bounded search: the target box, the
+            /// raw `distance_upper_bound`, and -- for a prepared query operand --
+            /// its precomputed bounding box (`qbox`), so an all-by-all never
+            /// re-folds it. `None` ub means an unbounded search.
             #[inline]
-            fn prune(&self, ub: Option<$t>) -> Option<($simd, $simd, $t)> {
-                ub.map(|u| (self.bbox_min, self.bbox_max, u))
+            fn prune(
+                &self,
+                ub: Option<$t>,
+                qbox: Option<($simd, $simd)>,
+            ) -> Option<($simd, $simd, $t, Option<($simd, $simd)>)> {
+                ub.map(|u| (self.bbox_min, self.bbox_max, u, qbox))
             }
 
             /// Borrow this prepared graph as a `$nbhd` view (no packing, no
@@ -638,7 +710,7 @@ macro_rules! impl_ann_for {
                 ub: Option<$t>,
             ) -> (Array1<$t>, Array1<usize>) {
                 let x = $nbhd::new(Cow::Owned($pack(x_points)), x_indptr, x_indices);
-                $search_pruned(&x, &self.as_graph(), self.prune(ub))
+                $search_pruned(&x, &self.as_graph(), self.prune(ub, None))
             }
 
             /// The k>1 variant of `query` (best-first search, `ef` breadth);
@@ -653,7 +725,7 @@ macro_rules! impl_ann_for {
                 ub: Option<$t>,
             ) -> (Array2<$t>, Array2<usize>) {
                 let x = $nbhd::new(Cow::Owned($pack(x_points)), x_indptr, x_indices);
-                $searchk(&x, &self.as_graph(), k, ef, self.prune(ub))
+                $searchk(&x, &self.as_graph(), k, ef, self.prune(ub, None))
             }
 
             /// Like `query`, but the query cloud is another prepared graph.
@@ -666,7 +738,8 @@ macro_rules! impl_ann_for {
                 other: &Self,
                 ub: Option<$t>,
             ) -> (Array1<$t>, Array1<usize>) {
-                $search_pruned(&other.as_graph(), &self.as_graph(), self.prune(ub))
+                let qbox = Some((other.bbox_min, other.bbox_max));
+                $search_pruned(&other.as_graph(), &self.as_graph(), self.prune(ub, qbox))
             }
 
             /// The k>1 variant of `query_prepared`; `ub` applies a
@@ -678,7 +751,8 @@ macro_rules! impl_ann_for {
                 ef: usize,
                 ub: Option<$t>,
             ) -> (Array2<$t>, Array2<usize>) {
-                $searchk(&other.as_graph(), &self.as_graph(), k, ef, self.prune(ub))
+                let qbox = Some((other.bbox_min, other.bbox_max));
+                $searchk(&other.as_graph(), &self.as_graph(), k, ef, self.prune(ub, qbox))
             }
 
             /// Buffer-reuse form of `query_prepared`: both operands are already
@@ -696,7 +770,8 @@ macro_rules! impl_ann_for {
                 idx: &mut Vec<usize>,
                 ub: Option<$t>,
             ) {
-                $search_into(&other.as_graph(), &self.as_graph(), ws, dists, idx, self.prune(ub));
+                let qbox = Some((other.bbox_min, other.bbox_max));
+                $search_into(&other.as_graph(), &self.as_graph(), ws, dists, idx, self.prune(ub, qbox));
             }
 
             /// Buffer-reuse form of `query`: recycles the output buffers, the
@@ -722,7 +797,7 @@ macro_rules! impl_ann_for {
                     pack.push(<$simd>::from([p[0], p[1], p[2], 0.0]));
                 }
                 let x = $nbhd::new(Cow::Borrowed(pack.as_slice()), x_indptr, x_indices);
-                $search_into(&x, &self.as_graph(), ws, dists, idx, self.prune(ub));
+                $search_into(&x, &self.as_graph(), ws, dists, idx, self.prune(ub, None));
             }
 
             /// Number of points in the prepared target.
@@ -747,11 +822,11 @@ macro_rules! impl_ann_for {
 
 impl_ann_for!(f64, f64x4, NeighborhoodF64, euclidean_distance_f64, get_neighbours_f64, find_nn_f64, search_f64,
               search_into_f64, HeapItemF64, find_knn_f64, search_k_f64, pack_points_f64, PreparedF64,
-              box_dist2_f64, box_box_dist2_f64, bbox_of_f64, search_pruned_f64);
+              box_dist2_f64, box_box_dist2_f64, bbox_of_f64, resolve_prune_f64, search_pruned_f64);
 // f32 variant: half the memory traffic per point, some precision loss.
 impl_ann_for!(f32, f32x4, NeighborhoodF32, euclidean_distance_f32, get_neighbours_f32, find_nn_f32, search_f32,
               search_into_f32, HeapItemF32, find_knn_f32, search_k_f32, pack_points_f32, PreparedF32,
-              box_dist2_f32, box_box_dist2_f32, bbox_of_f32, search_pruned_f32);
+              box_dist2_f32, box_box_dist2_f32, bbox_of_f32, resolve_prune_f32, search_pruned_f32);
 
 /// Build a vertex-adjacency CSR graph from Delaunay tetrahedra.
 ///
@@ -1131,17 +1206,19 @@ mod tests {
 
     #[test]
     fn bounded_matches_bruteforce() {
-        // Complete target graph -> exact NN. With a mid-range bound over two
-        // overlapping clouds (so the box-to-box short-circuit can't fire and
-        // every point runs the descent), the bounded result must equal brute
-        // force filtered by the bound: hits keep their NN, points whose nearest
-        // neighbour is beyond the bound report (inf, |target|). This exercises
-        // the after-descent marking for in-box-but-too-far points.
+        // Complete target graph -> exact NN. A query cloud that straddles the
+        // target box (spans [0,2] vs the target's [0,1]) with a mid-range bound:
+        // the box-to-box short-circuit can't fire, `check_points` is true, so
+        // this exercises *both* the per-point box prune (points far outside the
+        // box) and the after-descent marking (in-box points whose NN is still
+        // too far). The bounded result must equal brute force filtered by the
+        // bound: hits keep their NN, everything else reports (inf, |target|).
         let pts_t = lcg_cloud(300, 11);
         let (tptr, tidx) = complete_graph_csr(300);
         let tgt = PreparedF64::new(pts_t.view(), tptr.view(), tidx.view());
 
-        let pts_q = lcg_cloud(200, 12);
+        let mut pts_q = lcg_cloud(200, 12);
+        pts_q *= 2.0; // spans [0,2], so it extends beyond the target box by > bound
         let (qptr, qidx) = ring_graph_csr(200);
         let qry = PreparedF64::new(pts_q.view(), qptr.view(), qidx.view());
 
