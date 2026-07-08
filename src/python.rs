@@ -89,7 +89,7 @@ macro_rules! impl_py_ann_for {
             let (distances, indices) = py.detach(move || {
                 let x = $nbhd::new(Cow::Owned($pack(xp)), xi, xn);
                 let y = $nbhd::new(Cow::Owned($pack(yp)), yi, yn);
-                $searchk(&x, &y, k, ef)
+                $searchk(&x, &y, k, ef, None)
             });
 
             Ok((distances.into_pyarray(py), indices.into_pyarray(py)))
@@ -120,23 +120,31 @@ macro_rules! impl_py_ann_for {
             /// Nearest neighbour in the prepared target for each point of the
             /// query cloud `x` (given as its own CSR graph). GIL released for
             /// the search; `self`'s owned buffers are `Send`.
+            /// `distance_upper_bound` (a distance, not squared) reports the miss
+            /// marker (inf, |target|) for query points with no neighbour within
+            /// it, and lets the search prune via the target's bounding box.
+            #[pyo3(signature = (x_points, x_indptr, x_indices, distance_upper_bound=None))]
             fn query<'py>(
                 &self,
                 py: Python<'py>,
                 x_points: PyReadonlyArray2<$t>,
                 x_indptr: PyReadonlyArray1<usize>,
                 x_indices: PyReadonlyArray1<usize>,
+                distance_upper_bound: Option<$t>,
             ) -> PyResult<(Bound<'py, PyArray1<$t>>, Bound<'py, PyArray1<usize>>)> {
                 let xp = x_points.as_array();
                 let xi = x_indptr.as_array();
                 let xn = x_indices.as_array();
 
-                let (distances, indices) = py.detach(move || self.0.query(xp, xi, xn));
+                let (distances, indices) =
+                    py.detach(move || self.0.query(xp, xi, xn, distance_upper_bound));
 
                 Ok((distances.into_pyarray(py), indices.into_pyarray(py)))
             }
 
             /// The k>1 variant of `query` (best-first search, `ef` breadth).
+            /// `distance_upper_bound` is as in `query`.
+            #[pyo3(signature = (x_points, x_indptr, x_indices, k, ef, distance_upper_bound=None))]
             fn query_k<'py>(
                 &self,
                 py: Python<'py>,
@@ -145,12 +153,14 @@ macro_rules! impl_py_ann_for {
                 x_indices: PyReadonlyArray1<usize>,
                 k: usize,
                 ef: usize,
+                distance_upper_bound: Option<$t>,
             ) -> PyResult<(Bound<'py, PyArray2<$t>>, Bound<'py, PyArray2<usize>>)> {
                 let xp = x_points.as_array();
                 let xi = x_indptr.as_array();
                 let xn = x_indices.as_array();
 
-                let (distances, indices) = py.detach(move || self.0.query_k(xp, xi, xn, k, ef));
+                let (distances, indices) =
+                    py.detach(move || self.0.query_k(xp, xi, xn, k, ef, distance_upper_bound));
 
                 Ok((distances.into_pyarray(py), indices.into_pyarray(py)))
             }
@@ -158,28 +168,36 @@ macro_rules! impl_py_ann_for {
             /// Like `query`, but the query cloud is another prepared graph.
             /// Both operands are already SIMD-packed, so *nothing* is packed for
             /// this call -- this is the fast path for an all-by-all, where every
-            /// graph is a persistent operand.
+            /// graph is a persistent operand. `distance_upper_bound` is as in
+            /// `query`.
+            #[pyo3(signature = (other, distance_upper_bound=None))]
             fn query_prepared<'py>(
                 &self,
                 py: Python<'py>,
                 other: PyRef<'py, $pywrap>,
+                distance_upper_bound: Option<$t>,
             ) -> PyResult<(Bound<'py, PyArray1<$t>>, Bound<'py, PyArray1<usize>>)> {
                 let q: &$prepared = &other.0;
-                let (distances, indices) = py.detach(move || self.0.query_prepared(q));
+                let (distances, indices) =
+                    py.detach(move || self.0.query_prepared(q, distance_upper_bound));
 
                 Ok((distances.into_pyarray(py), indices.into_pyarray(py)))
             }
 
-            /// The k>1 variant of `query_prepared`.
+            /// The k>1 variant of `query_prepared`. `distance_upper_bound` is as
+            /// in `query`.
+            #[pyo3(signature = (other, k, ef, distance_upper_bound=None))]
             fn query_prepared_k<'py>(
                 &self,
                 py: Python<'py>,
                 other: PyRef<'py, $pywrap>,
                 k: usize,
                 ef: usize,
+                distance_upper_bound: Option<$t>,
             ) -> PyResult<(Bound<'py, PyArray2<$t>>, Bound<'py, PyArray2<usize>>)> {
                 let q: &$prepared = &other.0;
-                let (distances, indices) = py.detach(move || self.0.query_prepared_k(q, k, ef));
+                let (distances, indices) =
+                    py.detach(move || self.0.query_prepared_k(q, k, ef, distance_upper_bound));
 
                 Ok((distances.into_pyarray(py), indices.into_pyarray(py)))
             }

@@ -293,6 +293,41 @@ def test_distance_upper_bound():
     assert np.all(np.isfinite(d_near)) and np.all(i_near < N)
 
 
+def test_distance_upper_bound_pruning_matches_postfilter():
+    # The bounding-box pruning (box-to-box short-circuit + per-point skip + miss
+    # marking) must be equivalent to the old behaviour of running the full search
+    # and post-filtering by the bound -- for every path (raw vs AANN operand),
+    # dtype, reorder setting, k, and a query cloud that straddles the target so
+    # the per-point prune (not just the all-or-nothing short-circuit) is used.
+    rng = np.random.default_rng(7)
+    target = rng.random((400, 3))
+
+    def postfilter(index, x, k, ub):
+        d, i = index.query(x, k=k)  # unbounded
+        d, i = d.copy(), i.copy()
+        miss = d > ub
+        d[miss] = np.inf
+        i[miss] = index.n
+        return d, i
+
+    for dtype in ("float64", "float32"):
+        for reorder in (True, False):
+            index = aann.AANN(target, reorder=reorder, dtype=dtype)
+            straddle = (rng.random((300, 3)) * 3.0 - 1.0).astype(dtype)  # spans [-1, 2]
+            operands = {"raw": straddle, "aann": aann.AANN(straddle, reorder=reorder, dtype=dtype)}
+            for name, x in operands.items():
+                for k in (1, 3):
+                    for ub in (0.05, 0.2, 1.0):
+                        d, i = index.query(x, k=k, distance_upper_bound=ub)
+                        dref, iref = postfilter(index, x, k, ub)
+                        tag = f"{dtype} reorder={reorder} {name} k={k} ub={ub}"
+                        assert np.array_equal(np.isinf(d), np.isinf(dref)), tag
+                        hit = np.isfinite(dref)
+                        assert np.allclose(d[hit], dref[hit], atol=1e-5), tag
+                        assert np.array_equal(i[hit], iref[hit]), tag
+                        assert np.all(i[~hit] == index.n), tag
+
+
 def test_all_by_all():
     # Parallel all-by-all (GIL released in Rust) must match serial exactly.
     rng = np.random.default_rng(0)

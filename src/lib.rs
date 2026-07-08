@@ -24,7 +24,7 @@
 //! // to each other).
 //! let queries = array![[0.1, 0.0, 0.0], [0.9, 0.1, 0.0]];
 //! let (qptr, qidx) = (array![0usize, 1, 2], array![1usize, 0]);
-//! let (dists, idxs) = target.query(queries.view(), qptr.view(), qidx.view());
+//! let (dists, idxs) = target.query(queries.view(), qptr.view(), qidx.view(), None);
 //! assert_eq!(idxs.to_vec(), vec![0, 1]);
 //! assert!((dists[0] - 0.1).abs() < 1e-12);
 //! ```
@@ -37,6 +37,62 @@ use std::collections::BinaryHeap;
 /// The version of `ndarray` this crate's API is built against, re-exported so
 /// consumers don't have to pin a matching version themselves.
 pub use ndarray;
+
+/// Reusable per-thread scratch for the k=1 all-nearest-neighbour descent
+/// (`search_into_f64` / `search_into_f32` and the `query_*_into` methods).
+///
+/// It holds only vertex indices and generation stamps -- nothing tied to the
+/// coordinate type -- so one `Workspace` serves both the f32 and f64 pipelines.
+/// Recycle one per worker thread across an all-by-all: together with
+/// caller-owned output `Vec`s (see [`PreparedF64::query_prepared_into`]) it makes
+/// a warm query allocation-free, avoiding the per-pair churn of allocating the
+/// DFS stack and visited buffer on every call.
+pub struct Workspace {
+    /// DFS stack over the query graph: `(start-vertex-in-target, vertex-in-query)`.
+    stack: Vec<(usize, usize)>,
+    /// Generation stamps indexed by query vertex; `visited[v] == gen` marks `v`
+    /// seen in the current search. Avoids re-zeroing a `bool` array per call
+    /// (the same trick the k>1 `search_k_*` path already uses for its target
+    /// visited set).
+    visited: Vec<u32>,
+    gen: u32,
+}
+
+impl Workspace {
+    /// An empty workspace; its buffers grow to fit on first use.
+    pub fn new() -> Self {
+        Workspace { stack: Vec::new(), visited: Vec::new(), gen: 0 }
+    }
+
+    /// A workspace pre-sized for a query cloud of `n` points.
+    pub fn with_capacity(n: usize) -> Self {
+        Workspace { stack: Vec::with_capacity(n), visited: vec![0u32; n], gen: 0 }
+    }
+
+    /// Ready the workspace for a search over `n_x` query vertices and return the
+    /// generation to stamp visited nodes with this call. O(1) amortised: the
+    /// `visited` array is zero-filled only when it first grows past `n_x` or
+    /// when the `u32` generation counter wraps (~every 4 billion searches).
+    #[inline]
+    fn begin(&mut self, n_x: usize) -> u32 {
+        if self.visited.len() < n_x {
+            self.visited.resize(n_x, 0);
+        }
+        self.stack.clear();
+        self.gen = self.gen.wrapping_add(1);
+        if self.gen == 0 {
+            self.visited.fill(0);
+            self.gen = 1;
+        }
+        self.gen
+    }
+}
+
+impl Default for Workspace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Generate a full nearest-neighbour search pipeline for one coordinate type.
 ///
@@ -53,14 +109,20 @@ pub use ndarray;
 ///  `$neigh`    generated neighbour-slice helper name
 ///  `$find`     generated single nearest-neighbour search name
 ///  `$search`   generated all-nearest-neighbours search name
+///  `$search_into` generated buffer-reuse all-nearest-neighbours search name
 ///  `$hitem`    generated (distance, index) heap-item struct name
 ///  `$findk`    generated k>1 best-first search name
 ///  `$searchk`  generated k>1 all-nearest-neighbours search name
 ///  `$pack`     generated SIMD point-packing helper name
 ///  `$prepared` generated owned, pre-packed graph struct name
+///  `$box_dist2` generated point-to-box squared-distance helper name
+///  `$box_box_dist2` generated box-to-box squared-min-distance helper name
+///  `$bbox_of`  generated point-cloud bounding-box helper name
+///  `$search_pruned` generated allocating bound-aware k=1 search name
 macro_rules! impl_ann_for {
     ($t:ty, $simd:ty, $nbhd:ident, $dist:ident, $neigh:ident, $find:ident, $search:ident,
-     $hitem:ident, $findk:ident, $searchk:ident, $pack:ident, $prepared:ident) => {
+     $search_into:ident, $hitem:ident, $findk:ident, $searchk:ident, $pack:ident, $prepared:ident,
+     $box_dist2:ident, $box_box_dist2:ident, $bbox_of:ident, $search_pruned:ident) => {
         /// A neighborhood graph over `$t` coordinates.
         ///
         /// `indices`/`neighbors` are zero-copy CSR views into the caller's
@@ -103,6 +165,50 @@ macro_rules! impl_ann_for {
             (diff * diff).reduce_add()
         }
 
+        /// Squared euclidean distance from packed point `p` to the axis-aligned
+        /// box `[bmin, bmax]` (0 when `p` lies inside). Because the box contains
+        /// every target point, this is a lower bound on `p`'s distance to any of
+        /// them, so `$box_dist2(..) > ub²` proves no target lies within `ub` --
+        /// the geometric hook the greedy descent otherwise lacks. The packed pad
+        /// lane is 0 in `p`, `bmin` and `bmax`, so it contributes nothing.
+        #[inline]
+        pub fn $box_dist2(bmin: &$simd, bmax: &$simd, p: &$simd) -> $t {
+            let zero = <$simd>::from([0.0 as $t; 4]);
+            let below = (*bmin - *p).max(zero); // lo - p where p < lo, else 0
+            let above = (*p - *bmax).max(zero); // p - hi where p > hi, else 0
+            let d = below + above;              // per axis at most one is nonzero
+            (d * d).reduce_add()
+        }
+
+        /// Squared euclidean distance between two axis-aligned boxes (0 when they
+        /// overlap). A lower bound on the distance between *any* point of box A
+        /// and *any* point of box B, so `$box_box_dist2(..) > ub²` proves no
+        /// pair is within `ub` -- lets a whole separated query cloud be skipped
+        /// in one test.
+        #[inline]
+        pub fn $box_box_dist2(amin: &$simd, amax: &$simd, bmin: &$simd, bmax: &$simd) -> $t {
+            let zero = <$simd>::from([0.0 as $t; 4]);
+            // Per axis the gap is max(bmin - amax, amin - bmax, 0): positive only
+            // when the boxes are disjoint on that axis, in the direction of the
+            // gap; 0 when they overlap.
+            let gap = (*bmin - *amax).max(*amin - *bmax).max(zero);
+            (gap * gap).reduce_add()
+        }
+
+        /// Axis-aligned bounding box of a packed point cloud as `(min, max)`.
+        /// `pts` must be non-empty. The pad lane is 0 in every packed point, so
+        /// it stays 0 in both corners.
+        #[inline]
+        fn $bbox_of(pts: &[$simd]) -> ($simd, $simd) {
+            let mut mn = pts[0];
+            let mut mx = pts[0];
+            for p in &pts[1..] {
+                mn = mn.min(*p);
+                mx = mx.max(*p);
+            }
+            (mn, mx)
+        }
+
         /// Neighbour indices of `vertex`, as a zero-copy slice.
         #[inline(always)]
         fn $neigh<'a>(x: &$nbhd<'a>, vertex: usize) -> ArrayView1<'a, usize> {
@@ -115,15 +221,20 @@ macro_rules! impl_ann_for {
         /// seen and an already-examined node can never be re-selected -- hence no
         /// explicit "visited" set is needed.
         pub fn $find(y: &$nbhd, p: &$simd, start: usize) -> ($t, usize) {
+            // Hoist the CSR/point access to raw slices once per descent, so the
+            // inner loop indexes plain slices instead of rebuilding an ndarray
+            // view (`$neigh`'s `slice_move(s![..])`) on every visited vertex.
+            let pts: &[$simd] = &y.points_simd;
+            let indptr: &[usize] = y.indices.as_slice().expect("contiguous CSR indptr");
+            let neigh: &[usize] = y.neighbors.as_slice().expect("contiguous CSR neighbours");
+
             let mut vertex: usize = start;
-            let mut d = $dist(&y.points_simd[vertex], p);
+            let mut d = $dist(&pts[vertex], p);
 
             loop {
-                let neighbors = $neigh(y, vertex);
                 let mut vert_new = false;
-                for n in neighbors {
-                    let n = *n;
-                    let d_new = $dist(&y.points_simd[n], p);
+                for &n in &neigh[indptr[vertex]..indptr[vertex + 1]] {
+                    let d_new = $dist(&pts[n], p);
                     if d_new < d {
                         d = d_new;
                         vert_new = true;
@@ -137,49 +248,132 @@ macro_rules! impl_ann_for {
             (d.sqrt(), vertex)
         }
 
-        /// The full all-nearest-neighbours search over two graphs: for each
-        /// point in `x`, find its nearest neighbour among the points in `y`.
-        pub fn $search(x: &$nbhd, y: &$nbhd) -> (Array1<$t>, Array1<usize>) {
+        /// Buffer-reuse form of `$search`: writes each query point's nearest
+        /// neighbour into the caller-owned `dists`/`idx` (both resized to the
+        /// query cloud size) and recycles the DFS scratch held in `ws`. With a
+        /// warm `ws` and warm output buffers this performs no heap allocation --
+        /// the hot path for an all-by-all inner loop (see
+        /// `$prepared::query_prepared_into`). Behaviour is identical to
+        /// `$search`; only the buffers' provenance differs.
+        pub fn $search_into(
+            x: &$nbhd,
+            y: &$nbhd,
+            ws: &mut Workspace,
+            dists: &mut Vec<$t>,
+            idx: &mut Vec<usize>,
+            prune: Option<($simd, $simd, $t)>,
+        ) {
             let n_x = x.indices.len() - 1;
-            let mut distances = Array1::<$t>::zeros(n_x);
-            let mut indices = Array1::<usize>::zeros(n_x);
+            let n_y = y.points_simd.len();
+            // Exactly n_x slots: this grows (every slot is overwritten below, so
+            // the fill value is irrelevant) or truncates a larger buffer from a
+            // previous pair, so `&dists[..]` never exposes a stale tail.
+            dists.resize(n_x, 0.0);
+            idx.resize(n_x, 0);
+
+            let xpts: &[$simd] = &x.points_simd;
+
+            // `distance_upper_bound` handling (see `$prepared::query`). `prune`
+            // carries the target's bounding box and the raw bound; we work in
+            // squared distance (`ub2`) to match the descent. A point/box beyond
+            // the bound reports the miss marker (inf, |y|) -- scipy's convention.
+            let prune2 = prune.map(|(bmin, bmax, u)| (bmin, bmax, u * u));
+            if let Some((bmin, bmax, ub2)) = prune2 {
+                // Box-to-box short-circuit: if the whole query cloud is farther
+                // from the target's box than the bound, every point is a miss --
+                // skip the descent entirely (the big win for separated clouds).
+                if n_x > 0 {
+                    let (xmin, xmax) = $bbox_of(xpts);
+                    if $box_box_dist2(&xmin, &xmax, &bmin, &bmax) > ub2 {
+                        dists.iter_mut().for_each(|d| *d = <$t>::INFINITY);
+                        idx.iter_mut().for_each(|i| *i = n_y);
+                        return;
+                    }
+                }
+            }
 
             // Depth-first walk of `x`'s graph, each query warm-starting from the
             // previous nearest neighbour. Stack holds (start-in-y, vertex-in-x).
             // Restart on any unvisited root so a disconnected query graph (e.g.
             // an isolated point) is still fully searched instead of left at the
             // zero-initialised default; `seed` carries a warm start across
-            // components, mirroring the k>1 `$searchk`.
-            let mut stack: Vec<(usize, usize)> = Vec::with_capacity(n_x);
-            let mut visited_x = vec![false; n_x];
+            // components, mirroring the k>1 `$searchk`. `visited` is generation-
+            // stamped so a reused workspace needs no per-call re-zeroing.
+            let gen = ws.begin(n_x);
+            let Workspace { stack, visited, .. } = ws;
             let mut seed: usize = 0;
 
-            let mut d;
-            let mut ix;
+            // Raw slices over `x`'s CSR adjacency (see `$find`).
+            let xindptr: &[usize] = x.indices.as_slice().expect("contiguous CSR indptr");
+            let xneigh: &[usize] = x.neighbors.as_slice().expect("contiguous CSR neighbours");
+
             for root in 0..n_x {
-                if visited_x[root] {
+                if visited[root] == gen {
                     continue;
                 }
-                visited_x[root] = true;
+                visited[root] = gen;
                 stack.push((seed, root));
 
                 while let Some((start, v)) = stack.pop() {
-                    (d, ix) = $find(y, &x.points_simd[v], start);
-                    distances[v] = d;
-                    indices[v] = ix;
-                    seed = ix;
+                    // Prune: skip the descent when `v` is beyond the bound from
+                    // the whole target box, and mark it a miss when its found
+                    // neighbour is still too far. A miss keeps `seed` unchanged
+                    // and seeds children from the incoming `start`, so the warm
+                    // start survives a run of pruned points.
+                    let (d, ix) = match prune2 {
+                        Some((ref bmin, ref bmax, ub2)) => {
+                            if $box_dist2(bmin, bmax, &xpts[v]) > ub2 {
+                                (<$t>::INFINITY, n_y)
+                            } else {
+                                let (d, ix) = $find(y, &xpts[v], start);
+                                if d * d > ub2 { (<$t>::INFINITY, n_y) } else { (d, ix) }
+                            }
+                        }
+                        None => $find(y, &xpts[v], start),
+                    };
+                    dists[v] = d;
+                    idx[v] = ix;
+                    let child_start = if ix == n_y {
+                        start
+                    } else {
+                        seed = ix;
+                        ix
+                    };
 
-                    for n2 in $neigh(x, v) {
-                        let m = *n2;
-                        if !visited_x[m] {
-                            visited_x[m] = true;
-                            stack.push((ix, m));
+                    for &m in &xneigh[xindptr[v]..xindptr[v + 1]] {
+                        if visited[m] != gen {
+                            visited[m] = gen;
+                            stack.push((child_start, m));
                         }
                     }
                 }
             }
+        }
 
-            (distances, indices)
+        /// The full all-nearest-neighbours search over two graphs: for each
+        /// point in `x`, find its nearest neighbour among the points in `y`.
+        /// Allocates the output arrays and scratch fresh; for an all-by-all
+        /// where buffers can be recycled, prefer `$search_into` /
+        /// `$prepared::query_prepared_into`.
+        pub fn $search(x: &$nbhd, y: &$nbhd) -> (Array1<$t>, Array1<usize>) {
+            $search_pruned(x, y, None)
+        }
+
+        /// Bound-aware `$search`: `prune = Some((box_min, box_max, ub))` reports
+        /// the miss marker (inf, |y|) for every query point with no `y` neighbour
+        /// within `ub`, using the target box to skip the descent where it
+        /// provably can't help (see `$search_into`). `None` is plain `$search`.
+        pub fn $search_pruned(
+            x: &$nbhd,
+            y: &$nbhd,
+            prune: Option<($simd, $simd, $t)>,
+        ) -> (Array1<$t>, Array1<usize>) {
+            let n_x = x.indices.len() - 1;
+            let mut ws = Workspace::with_capacity(n_x);
+            let mut dists: Vec<$t> = Vec::with_capacity(n_x);
+            let mut idx: Vec<usize> = Vec::with_capacity(n_x);
+            $search_into(x, y, &mut ws, &mut dists, &mut idx, prune);
+            (Array1::from(dists), Array1::from(idx))
         }
 
         /// A (squared distance, index) pair with a total order on the distance
@@ -266,11 +460,31 @@ macro_rules! impl_ann_for {
         /// than `k` results (disconnected graph or k > |y|); the outer loop
         /// restarts the walk on every unvisited `x` vertex, so disconnected
         /// query graphs are covered too.
-        pub fn $searchk(x: &$nbhd, y: &$nbhd, k: usize, ef: usize) -> (Array2<$t>, Array2<usize>) {
+        pub fn $searchk(
+            x: &$nbhd,
+            y: &$nbhd,
+            k: usize,
+            ef: usize,
+            prune: Option<($simd, $simd, $t)>,
+        ) -> (Array2<$t>, Array2<usize>) {
             let n_x = x.indices.len() - 1;
             let n_y = y.points_simd.len();
             let mut distances = Array2::<$t>::from_elem((n_x, k), <$t>::INFINITY);
             let mut indices = Array2::<usize>::from_elem((n_x, k), n_y);
+
+            // `distance_upper_bound` (see `$search_into`): squared bound + target
+            // box. Rows already hold the miss marker (inf, |y|), so pruning just
+            // leaves them untouched. Heap items carry *squared* distances, so we
+            // compare against `ub2` directly and only `sqrt` the ones we keep.
+            let prune2 = prune.map(|(bmin, bmax, u)| (bmin, bmax, u * u));
+            if let Some((bmin, bmax, ub2)) = prune2 {
+                if n_x > 0 {
+                    let (xmin, xmax) = $bbox_of(&x.points_simd);
+                    if $box_box_dist2(&xmin, &xmax, &bmin, &bmax) > ub2 {
+                        return (distances, indices); // whole cloud out of range
+                    }
+                }
+            }
 
             // Per-search scratch, reused across all queries.
             let mut visited: Vec<u32> = vec![0; n_y];
@@ -292,17 +506,43 @@ macro_rules! impl_ann_for {
                 stack.push((seed, root));
 
                 while let Some((start, v)) = stack.pop() {
+                    // Whole target box beyond the bound: leave the row a miss and
+                    // keep the warm `seed` (do not advance it off a pruned point).
+                    if let Some((bmin, bmax, ub2)) = prune2 {
+                        if $box_dist2(&bmin, &bmax, &x.points_simd[v]) > ub2 {
+                            for n2 in $neigh(x, v) {
+                                let m = *n2;
+                                if !visited_x[m] {
+                                    visited_x[m] = true;
+                                    stack.push((seed, m));
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
                     gen = gen.wrapping_add(1);
                     if gen == 0 {
                         visited.fill(0);
                         gen = 1;
                     }
                     $findk(y, &x.points_simd[v], start, ef, &mut visited, gen, &mut cand, &mut res);
+                    let mut hit = false;
                     for (j, item) in res.iter().take(k).enumerate() {
+                        // Results are ascending, so once one exceeds the bound the
+                        // rest do too -- leave those slots as the (inf, |y|) marker.
+                        if let Some((_, _, ub2)) = prune2 {
+                            if item.d > ub2 {
+                                break;
+                            }
+                        }
                         distances[[v, j]] = item.d.sqrt();
                         indices[[v, j]] = item.ix;
+                        hit = true;
                     }
-                    seed = res[0].ix;
+                    if hit {
+                        seed = res[0].ix; // advance the warm start only on a real hit
+                    }
 
                     for n2 in $neigh(x, v) {
                         let m = *n2;
@@ -333,6 +573,12 @@ macro_rules! impl_ann_for {
             indptr: Vec<usize>,
             indices: Vec<usize>,
             n: usize,
+            /// Axis-aligned bounding box of the target points, computed once here
+            /// so a bounded `query` can skip descents the box rules out (see
+            /// `$search_into`). For an empty target it is `(inf, -inf)`, which
+            /// prunes everything -- correct, since there are no neighbours.
+            bbox_min: $simd,
+            bbox_max: $simd,
         }
 
         impl $prepared {
@@ -342,12 +588,30 @@ macro_rules! impl_ann_for {
                 indices: ArrayView1<usize>,
             ) -> Self {
                 let n = points.nrows();
+                let points_simd = $pack(points);
+                let (bbox_min, bbox_max) = if points_simd.is_empty() {
+                    (
+                        <$simd>::from([<$t>::INFINITY; 4]),
+                        <$simd>::from([<$t>::NEG_INFINITY; 4]),
+                    )
+                } else {
+                    $bbox_of(&points_simd)
+                };
                 $prepared {
-                    points_simd: $pack(points),
+                    points_simd,
                     indptr: indptr.to_vec(),
                     indices: indices.to_vec(),
                     n,
+                    bbox_min,
+                    bbox_max,
                 }
+            }
+
+            /// Build the pruning tuple for a bounded search: the target box plus
+            /// the raw `distance_upper_bound`, or `None` for an unbounded search.
+            #[inline]
+            fn prune(&self, ub: Option<$t>) -> Option<($simd, $simd, $t)> {
+                ub.map(|u| (self.bbox_min, self.bbox_max, u))
             }
 
             /// Borrow this prepared graph as a `$nbhd` view (no packing, no
@@ -362,18 +626,23 @@ macro_rules! impl_ann_for {
 
             /// Nearest neighbour in the prepared target for each point of the
             /// query cloud `x` (given as its own CSR graph). Mirrors `$search`
-            /// but reuses `self`'s pre-packed points.
+            /// but reuses `self`'s pre-packed points. `ub = Some(d)` applies a
+            /// `distance_upper_bound`: query points with no neighbour within `d`
+            /// report the miss marker (inf, |target|), and the target box lets
+            /// the search skip descents it rules out.
             pub fn query(
                 &self,
                 x_points: ArrayView2<$t>,
                 x_indptr: ArrayView1<usize>,
                 x_indices: ArrayView1<usize>,
+                ub: Option<$t>,
             ) -> (Array1<$t>, Array1<usize>) {
                 let x = $nbhd::new(Cow::Owned($pack(x_points)), x_indptr, x_indices);
-                $search(&x, &self.as_graph())
+                $search_pruned(&x, &self.as_graph(), self.prune(ub))
             }
 
-            /// The k>1 variant of `query` (best-first search, `ef` breadth).
+            /// The k>1 variant of `query` (best-first search, `ef` breadth);
+            /// `ub` applies a `distance_upper_bound` (see `query`).
             pub fn query_k(
                 &self,
                 x_points: ArrayView2<$t>,
@@ -381,27 +650,79 @@ macro_rules! impl_ann_for {
                 x_indices: ArrayView1<usize>,
                 k: usize,
                 ef: usize,
+                ub: Option<$t>,
             ) -> (Array2<$t>, Array2<usize>) {
                 let x = $nbhd::new(Cow::Owned($pack(x_points)), x_indptr, x_indices);
-                $searchk(&x, &self.as_graph(), k, ef)
+                $searchk(&x, &self.as_graph(), k, ef, self.prune(ub))
             }
 
             /// Like `query`, but the query cloud is another prepared graph.
             /// Both operands are already SIMD-packed, so *nothing* is packed for
             /// this call (both views are `Cow::Borrowed`) -- this is the fast
             /// path for an all-by-all, where every graph is a persistent operand.
-            pub fn query_prepared(&self, other: &Self) -> (Array1<$t>, Array1<usize>) {
-                $search(&other.as_graph(), &self.as_graph())
+            /// `ub` applies a `distance_upper_bound` (see `query`).
+            pub fn query_prepared(
+                &self,
+                other: &Self,
+                ub: Option<$t>,
+            ) -> (Array1<$t>, Array1<usize>) {
+                $search_pruned(&other.as_graph(), &self.as_graph(), self.prune(ub))
             }
 
-            /// The k>1 variant of `query_prepared`.
+            /// The k>1 variant of `query_prepared`; `ub` applies a
+            /// `distance_upper_bound` (see `query`).
             pub fn query_prepared_k(
                 &self,
                 other: &Self,
                 k: usize,
                 ef: usize,
+                ub: Option<$t>,
             ) -> (Array2<$t>, Array2<usize>) {
-                $searchk(&other.as_graph(), &self.as_graph(), k, ef)
+                $searchk(&other.as_graph(), &self.as_graph(), k, ef, self.prune(ub))
+            }
+
+            /// Buffer-reuse form of `query_prepared`: both operands are already
+            /// SIMD-packed, so with a warm `ws` and warm `dists`/`idx` this does
+            /// no heap allocation -- the fast path for an all-by-all inner loop.
+            /// `dists`/`idx` are resized to the query cloud (`other`) size; read
+            /// `&dists[..]` / `&idx[..]` after the call. Results are identical to
+            /// `query_prepared` (same operand order: `other` is the query, `self`
+            /// the target).
+            pub fn query_prepared_into(
+                &self,
+                other: &Self,
+                ws: &mut Workspace,
+                dists: &mut Vec<$t>,
+                idx: &mut Vec<usize>,
+                ub: Option<$t>,
+            ) {
+                $search_into(&other.as_graph(), &self.as_graph(), ws, dists, idx, self.prune(ub));
+            }
+
+            /// Buffer-reuse form of `query`: recycles the output buffers, the
+            /// DFS scratch `ws`, and the SIMD-pack scratch `pack`. The query
+            /// cloud must still be packed (into the reused `pack` buffer, which
+            /// is a separate argument rather than part of `Workspace` because it
+            /// is coordinate-type specific). Results are identical to `query`.
+            #[allow(clippy::too_many_arguments)]
+            pub fn query_into(
+                &self,
+                x_points: ArrayView2<$t>,
+                x_indptr: ArrayView1<usize>,
+                x_indices: ArrayView1<usize>,
+                ws: &mut Workspace,
+                pack: &mut Vec<$simd>,
+                dists: &mut Vec<$t>,
+                idx: &mut Vec<usize>,
+                ub: Option<$t>,
+            ) {
+                pack.clear();
+                pack.reserve(x_points.nrows());
+                for p in x_points.outer_iter() {
+                    pack.push(<$simd>::from([p[0], p[1], p[2], 0.0]));
+                }
+                let x = $nbhd::new(Cow::Borrowed(pack.as_slice()), x_indptr, x_indices);
+                $search_into(&x, &self.as_graph(), ws, dists, idx, self.prune(ub));
             }
 
             /// Number of points in the prepared target.
@@ -425,10 +746,12 @@ macro_rules! impl_ann_for {
 }
 
 impl_ann_for!(f64, f64x4, NeighborhoodF64, euclidean_distance_f64, get_neighbours_f64, find_nn_f64, search_f64,
-              HeapItemF64, find_knn_f64, search_k_f64, pack_points_f64, PreparedF64);
+              search_into_f64, HeapItemF64, find_knn_f64, search_k_f64, pack_points_f64, PreparedF64,
+              box_dist2_f64, box_box_dist2_f64, bbox_of_f64, search_pruned_f64);
 // f32 variant: half the memory traffic per point, some precision loss.
 impl_ann_for!(f32, f32x4, NeighborhoodF32, euclidean_distance_f32, get_neighbours_f32, find_nn_f32, search_f32,
-              HeapItemF32, find_knn_f32, search_k_f32, pack_points_f32, PreparedF32);
+              search_into_f32, HeapItemF32, find_knn_f32, search_k_f32, pack_points_f32, PreparedF32,
+              box_dist2_f32, box_box_dist2_f32, bbox_of_f32, search_pruned_f32);
 
 /// Build a vertex-adjacency CSR graph from Delaunay tetrahedra.
 ///
@@ -531,13 +854,13 @@ mod tests {
         // Same result through the owned/prepared API.
         let target = PreparedF64::new(points.view(), indptr.view(), indices.view());
         assert_eq!(target.n(), 4);
-        let (dists2, idxs2) = target.query(queries.view(), indptr.view(), indices.view());
+        let (dists2, idxs2) = target.query(queries.view(), indptr.view(), indices.view(), None);
         assert_eq!(idxs2.to_vec(), idxs.to_vec());
         assert_eq!(dists2.to_vec(), dists.to_vec());
 
         // And prepared-vs-prepared (the pack-free path).
         let qprep = PreparedF64::new(queries.view(), indptr.view(), indices.view());
-        let (dists3, idxs3) = target.query_prepared(&qprep);
+        let (dists3, idxs3) = target.query_prepared(&qprep, None);
         assert_eq!(idxs3.to_vec(), idxs.to_vec());
         assert_eq!(dists3.to_vec(), dists.to_vec());
     }
@@ -550,7 +873,7 @@ mod tests {
         let (qptr, qidx) = (array![0usize, 0], Array1::<usize>::zeros(0));
 
         let target = PreparedF64::new(points.view(), indptr.view(), indices.view());
-        let (dists, idxs) = target.query_k(query.view(), qptr.view(), qidx.view(), 2, 4);
+        let (dists, idxs) = target.query_k(query.view(), qptr.view(), qidx.view(), 2, 4, None);
         // Nearest = corner 0 (d=0.01), second = corner 1 (d=0.99), ascending.
         assert_eq!(idxs.row(0).to_vec(), vec![0, 1]);
         assert!((dists[[0, 0]] - 0.01).abs() < 1e-12);
@@ -558,7 +881,7 @@ mod tests {
         assert!(dists[[0, 0]] < dists[[0, 1]]);
 
         // k > |y|: missing entries are (inf, |y|)-padded.
-        let (dists, idxs) = target.query_k(query.view(), qptr.view(), qidx.view(), 6, 8);
+        let (dists, idxs) = target.query_k(query.view(), qptr.view(), qidx.view(), 6, 8, None);
         assert_eq!(idxs.row(0).to_vec(), vec![0, 1, 2, 3, 4, 4]);
         assert!(dists[[0, 4]].is_infinite() && dists[[0, 5]].is_infinite());
     }
@@ -574,10 +897,297 @@ mod tests {
 
         let target = PreparedF32::new(points.view(), indptr.view(), indices.view());
         let qprep = PreparedF32::new(queries.view(), indptr.view(), indices.view());
-        let (dists, idxs) = target.query_prepared(&qprep);
+        let (dists, idxs) = target.query_prepared(&qprep, None);
         assert_eq!(idxs.to_vec(), vec![0, 1, 2, 3]);
         for d in dists.iter() {
             assert!((d - 0.01).abs() < 1e-6);
         }
+    }
+
+    // ---- deterministic fixtures for the buffer-reuse + oracle tests --------
+
+    /// A deterministic pseudo-random point cloud in the unit cube (LCG, so no
+    /// `rand` dependency and fully reproducible across runs/platforms).
+    fn lcg_cloud(n: usize, seed: u64) -> Array2<f64> {
+        let mut s = seed | 1;
+        let mut pts = Array2::<f64>::zeros((n, 3));
+        for i in 0..n {
+            for c in 0..3 {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                pts[[i, c]] = (s >> 11) as f64 / (1u64 << 53) as f64;
+            }
+        }
+        pts
+    }
+
+    /// Complete graph on `n` vertices as CSR (every vertex neighbours all
+    /// others). A superset of any Delaunay graph, so the greedy descent is
+    /// provably exact on it -- the dependency-free 100%-recall oracle graph.
+    fn complete_graph_csr(n: usize) -> (Array1<usize>, Array1<usize>) {
+        let mut indptr = Vec::with_capacity(n + 1);
+        let mut indices = Vec::with_capacity(n * n.saturating_sub(1));
+        indptr.push(0);
+        for v in 0..n {
+            for u in 0..n {
+                if u != v {
+                    indices.push(u);
+                }
+            }
+            indptr.push(indices.len());
+        }
+        (Array1::from(indptr), Array1::from(indices))
+    }
+
+    /// Sparse ring-lattice graph: each vertex links to +/-1, +/-2 (mod n).
+    /// Forces multi-hop descents that exercise the warm-start chaining (needs
+    /// `n >= 5` to stay simple/self-loop-free).
+    fn ring_graph_csr(n: usize) -> (Array1<usize>, Array1<usize>) {
+        let mut indptr = Vec::with_capacity(n + 1);
+        let mut indices = Vec::new();
+        indptr.push(0);
+        for v in 0..n {
+            let mut nb = vec![
+                (v + n - 2) % n,
+                (v + n - 1) % n,
+                (v + 1) % n,
+                (v + 2) % n,
+            ];
+            nb.sort_unstable();
+            nb.dedup();
+            nb.retain(|&u| u != v);
+            indices.extend_from_slice(&nb);
+            indptr.push(indices.len());
+        }
+        (Array1::from(indptr), Array1::from(indices))
+    }
+
+    /// Exact nearest neighbour by O(n) scan: `(argmin index, sqrt distance)`.
+    fn brute_nn(pts: &Array2<f64>, q: [f64; 3]) -> (usize, f64) {
+        let mut best_ix = 0usize;
+        let mut best_d2 = f64::INFINITY;
+        for (i, row) in pts.outer_iter().enumerate() {
+            let (dx, dy, dz) = (row[0] - q[0], row[1] - q[1], row[2] - q[2]);
+            let d2 = dx * dx + dy * dy + dz * dz;
+            if d2 < best_d2 {
+                best_d2 = d2;
+                best_ix = i;
+            }
+        }
+        (best_ix, best_d2.sqrt())
+    }
+
+    #[test]
+    fn query_prepared_into_matches_query_prepared() {
+        // (a) Tetrahedron: the buffer-reuse path is bit-for-bit identical to the
+        // allocating `query_prepared`.
+        let (points, indptr, indices) = tetrahedron();
+        let mut queries = points.clone();
+        for mut row in queries.outer_iter_mut() {
+            row[0] += 0.01;
+        }
+        let target = PreparedF64::new(points.view(), indptr.view(), indices.view());
+        let qprep = PreparedF64::new(queries.view(), indptr.view(), indices.view());
+        let (d0, i0) = target.query_prepared(&qprep, None);
+
+        let mut ws = Workspace::new();
+        let (mut d, mut i) = (Vec::new(), Vec::new());
+        target.query_prepared_into(&qprep, &mut ws, &mut d, &mut i, None);
+        assert_eq!(d0.to_vec(), d);
+        assert_eq!(i0.to_vec(), i);
+
+        // (b) Larger clouds, reusing the SAME ws/buffers across a big-then-small
+        // query: the small result must match its own fresh `query_prepared` with
+        // no stale tail leaking from the bigger prior call.
+        let pts_t = lcg_cloud(250, 1);
+        let (tptr, tidx) = complete_graph_csr(250);
+        let tgt = PreparedF64::new(pts_t.view(), tptr.view(), tidx.view());
+
+        let pts_big = lcg_cloud(300, 2);
+        let (bptr, bidx) = ring_graph_csr(300);
+        let q_big = PreparedF64::new(pts_big.view(), bptr.view(), bidx.view());
+
+        let pts_small = lcg_cloud(120, 3);
+        let (sptr, sidx) = ring_graph_csr(120);
+        let q_small = PreparedF64::new(pts_small.view(), sptr.view(), sidx.view());
+
+        let (db0, ib0) = tgt.query_prepared(&q_big, None);
+        let (ds0, is0) = tgt.query_prepared(&q_small, None);
+
+        tgt.query_prepared_into(&q_big, &mut ws, &mut d, &mut i, None);
+        assert_eq!(db0.to_vec(), d);
+        assert_eq!(ib0.to_vec(), i);
+
+        tgt.query_prepared_into(&q_small, &mut ws, &mut d, &mut i, None);
+        assert_eq!(d.len(), 120);
+        assert_eq!(i.len(), 120);
+        assert_eq!(ds0.to_vec(), d);
+        assert_eq!(is0.to_vec(), i);
+    }
+
+    #[test]
+    fn query_prepared_into_matches_f32() {
+        // The single `Workspace` type drives the f32 pipeline too.
+        let (points, indptr, indices) = tetrahedron();
+        let points = points.mapv(|v| v as f32);
+        let mut queries = points.clone();
+        for mut row in queries.outer_iter_mut() {
+            row[0] += 0.01;
+        }
+        let target = PreparedF32::new(points.view(), indptr.view(), indices.view());
+        let qprep = PreparedF32::new(queries.view(), indptr.view(), indices.view());
+        let (d0, i0) = target.query_prepared(&qprep, None);
+
+        let mut ws = Workspace::new();
+        let (mut d, mut i) = (Vec::new(), Vec::new());
+        target.query_prepared_into(&qprep, &mut ws, &mut d, &mut i, None);
+        assert_eq!(d0.to_vec(), d);
+        assert_eq!(i0.to_vec(), i);
+    }
+
+    #[test]
+    fn query_into_matches_query() {
+        let (points, indptr, indices) = tetrahedron();
+        let mut queries = points.clone();
+        for mut row in queries.outer_iter_mut() {
+            row[0] += 0.01;
+        }
+        let target = PreparedF64::new(points.view(), indptr.view(), indices.view());
+        let (d0, i0) = target.query(queries.view(), indptr.view(), indices.view(), None);
+
+        let mut ws = Workspace::new();
+        let (mut pack, mut d, mut i) = (Vec::new(), Vec::new(), Vec::new());
+        target.query_into(
+            queries.view(),
+            indptr.view(),
+            indices.view(),
+            &mut ws,
+            &mut pack,
+            &mut d,
+            &mut i,
+            None,
+        );
+        assert_eq!(d0.to_vec(), d);
+        assert_eq!(i0.to_vec(), i);
+    }
+
+    #[test]
+    fn descent_is_exact_on_complete_graph() {
+        // On a complete target graph the greedy descent examines every vertex
+        // from any start, so it returns the exact nearest neighbour -- a
+        // dependency-free 100%-recall check (complete graph is a superset of any
+        // Delaunay graph, so this bounds the genuine-Delaunay recall from below).
+        let pts_t = lcg_cloud(300, 10);
+        let (tptr, tidx) = complete_graph_csr(300);
+        let tgt = PreparedF64::new(pts_t.view(), tptr.view(), tidx.view());
+
+        let pts_q = lcg_cloud(200, 20);
+        let (qptr, qidx) = ring_graph_csr(200);
+        let qry = PreparedF64::new(pts_q.view(), qptr.view(), qidx.view());
+
+        // Fresh allocating path and buffer-reuse path must both be exact.
+        let (d, idx) = tgt.query_prepared(&qry, None);
+        let mut ws = Workspace::new();
+        let (mut d2, mut i2) = (Vec::new(), Vec::new());
+        tgt.query_prepared_into(&qry, &mut ws, &mut d2, &mut i2, None);
+        assert_eq!(idx.to_vec(), i2);
+        assert_eq!(d.to_vec(), d2);
+
+        for v in 0..pts_q.nrows() {
+            let q = [pts_q[[v, 0]], pts_q[[v, 1]], pts_q[[v, 2]]];
+            let (truth_ix, truth_d) = brute_nn(&pts_t, q);
+            assert_eq!(idx[v], truth_ix, "vertex {v}: descent picked a non-optimal NN");
+            assert!((d[v] - truth_d).abs() < 1e-9, "vertex {v}: distance mismatch");
+        }
+    }
+
+    #[test]
+    fn bounded_prunes_separated_clouds() {
+        // Target in the unit cube; query shifted far away (+10 per axis), so the
+        // two bounding boxes are ~15.6 apart. A tight `distance_upper_bound`
+        // reports every query point as a miss via the box-to-box short-circuit,
+        // while a loose one recovers exactly the unbounded nearest neighbours.
+        let pts_t = lcg_cloud(200, 7);
+        let (tptr, tidx) = complete_graph_csr(200);
+        let tgt = PreparedF64::new(pts_t.view(), tptr.view(), tidx.view());
+
+        let mut pts_q = lcg_cloud(150, 8);
+        pts_q += 10.0;
+        let (qptr, qidx) = ring_graph_csr(150);
+        let qry = PreparedF64::new(pts_q.view(), qptr.view(), qidx.view());
+
+        // Tight bound: all misses (inf, |target|).
+        let (d, idx) = tgt.query_prepared(&qry, Some(5.0));
+        assert!(d.iter().all(|v| v.is_infinite()));
+        assert!(idx.iter().all(|&v| v == tgt.n()));
+
+        // Loose bound: bit-identical to the unbounded search.
+        let (d0, i0) = tgt.query_prepared(&qry, None);
+        let (db, ib) = tgt.query_prepared(&qry, Some(1000.0));
+        assert_eq!(d0.to_vec(), db.to_vec());
+        assert_eq!(i0.to_vec(), ib.to_vec());
+    }
+
+    #[test]
+    fn bounded_matches_bruteforce() {
+        // Complete target graph -> exact NN. With a mid-range bound over two
+        // overlapping clouds (so the box-to-box short-circuit can't fire and
+        // every point runs the descent), the bounded result must equal brute
+        // force filtered by the bound: hits keep their NN, points whose nearest
+        // neighbour is beyond the bound report (inf, |target|). This exercises
+        // the after-descent marking for in-box-but-too-far points.
+        let pts_t = lcg_cloud(300, 11);
+        let (tptr, tidx) = complete_graph_csr(300);
+        let tgt = PreparedF64::new(pts_t.view(), tptr.view(), tidx.view());
+
+        let pts_q = lcg_cloud(200, 12);
+        let (qptr, qidx) = ring_graph_csr(200);
+        let qry = PreparedF64::new(pts_q.view(), qptr.view(), qidx.view());
+
+        let bound = 0.1_f64;
+        let (d, idx) = tgt.query_prepared(&qry, Some(bound));
+
+        let (mut n_hits, mut n_miss) = (0usize, 0usize);
+        for v in 0..pts_q.nrows() {
+            let q = [pts_q[[v, 0]], pts_q[[v, 1]], pts_q[[v, 2]]];
+            let (truth_ix, truth_d) = brute_nn(&pts_t, q);
+            if truth_d <= bound {
+                assert_eq!(idx[v], truth_ix, "vertex {v}: bounded hit picked wrong NN");
+                assert!((d[v] - truth_d).abs() < 1e-9, "vertex {v}: distance mismatch");
+                n_hits += 1;
+            } else {
+                assert!(d[v].is_infinite(), "vertex {v}: nearest is beyond the bound, expected a miss");
+                assert_eq!(idx[v], tgt.n(), "vertex {v}: miss marker");
+                n_miss += 1;
+            }
+        }
+        // The bound should split the cloud, so both branches above are exercised.
+        assert!(n_hits > 0 && n_miss > 0, "expected both hits and misses (got {n_hits} hits, {n_miss} misses)");
+    }
+
+    #[test]
+    fn bounded_k_prunes_and_marks() {
+        // The bound flows through the k>1 best-first path too.
+        let pts_t = lcg_cloud(120, 21);
+        let (tptr, tidx) = complete_graph_csr(120);
+        let tgt = PreparedF64::new(pts_t.view(), tptr.view(), tidx.view());
+
+        let mut pts_q = lcg_cloud(60, 22);
+        pts_q += 10.0; // separated cloud
+        let (qptr, qidx) = ring_graph_csr(60);
+        let qry = PreparedF64::new(pts_q.view(), qptr.view(), qidx.view());
+
+        let k = 3;
+        // Tight bound: every row is fully (inf, |target|)-marked.
+        let (d, idx) = tgt.query_prepared_k(&qry, k, k, Some(2.0));
+        assert!(d.iter().all(|v| v.is_infinite()));
+        assert!(idx.iter().all(|&v| v == tgt.n()));
+
+        // Loose bound: bit-identical to the unbounded k>1 search.
+        let (d0, i0) = tgt.query_prepared_k(&qry, k, k, None);
+        let (db, ib) = tgt.query_prepared_k(&qry, k, k, Some(1000.0));
+        assert_eq!(d0, db);
+        assert_eq!(i0, ib);
     }
 }

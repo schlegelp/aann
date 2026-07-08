@@ -115,6 +115,15 @@ class AANN:
         self.dtype = g.dtype
         self.n = g.points.shape[0]
         self._perm = g.perm
+        # Axis-aligned bounding box of the target (search dtype, order-independent
+        # so the Morton reorder does not matter). Cached for the box-to-box
+        # short-circuit a bounded query can take before triangulating a raw
+        # cloud. Empty target -> (inf, -inf), which prunes everything.
+        if self.n:
+            self._bbox = (g.points.min(0), g.points.max(0))
+        else:
+            inf = np.full(3, np.inf, dtype=g.dtype)
+            self._bbox = (inf, -inf)
         if g.dtype == np.dtype(np.float32):
             self._rust = _aann.PreparedF32(g.points, g.indptr, g.indices)
         else:
@@ -146,9 +155,11 @@ class AANN:
                 points whose nearest neighbour is farther get ``d=inf`` and
                 ``i=len(target)`` -- the same missing-neighbour convention as
                 ``scipy.spatial.cKDTree.query``, so hits are ``i < len(target)``.
-                ``None`` (default) and ``inf`` disable the bound. This filters the
-                results only: the descent has no geometric lower bound to prune
-                against, so unlike a KD-tree the bound does not speed it up.
+                ``None`` (default) and ``inf`` disable the bound. The target
+                cloud's bounding box lets the search skip individual query points
+                -- or the whole cloud in one test -- that provably fall outside
+                the bound, so unlike the unbounded search a tight bound can also
+                make it *faster* on well-separated clouds.
         ef :    None | int
                 Search breadth for ``k>1`` (ignored for ``k=1``): the best-first
                 search keeps the ``ef >= k`` closest candidates and returns the
@@ -172,6 +183,13 @@ class AANN:
         if isinstance(k, bool) or not isinstance(k, (int, np.integer)) or k < 1:
             raise ValueError(f"k must be a positive integer, got {k!r}")
 
+        # Normalise the bound: None / inf disable it. When finite it is passed to
+        # Rust, which prunes via the target's bounding box and marks out-of-range
+        # points as misses; ``_finalize_results`` re-applies it as a safety net.
+        ub = None
+        if distance_upper_bound is not None and distance_upper_bound < np.inf:
+            ub = float(distance_upper_bound)
+
         if isinstance(x, AANN):
             if x.dtype != self.dtype:
                 raise ValueError(
@@ -179,18 +197,26 @@ class AANN:
                     f"({x.dtype} vs {self.dtype})"
                 )
             if k == 1:
-                d, i = self._rust.query_prepared(x._rust)
+                d, i = self._rust.query_prepared(x._rust, ub)
             else:
                 ef_eff = _effective_ef(ef, k, self.n)
-                d, i = self._rust.query_prepared_k(x._rust, k, ef_eff)
+                d, i = self._rust.query_prepared_k(x._rust, k, ef_eff, ub)
             gx_perm = x._perm
         else:
+            # Box-to-box short-circuit *before* triangulating a raw cloud: if the
+            # whole query cloud is out of range there is no neighbour to find, so
+            # skip the (costly) graph build entirely. Rust repeats this test for
+            # already-prepared operands, where no triangulation is at stake.
+            if ub is not None:
+                sc = _box_box_short_circuit(x, self._bbox, ub, k, self.n, self.dtype)
+                if sc is not None:
+                    return sc
             gx = _build_prepared(x, graph, graph_k, self.dtype, backend)
             if k == 1:
-                d, i = self._rust.query(gx.points, gx.indptr, gx.indices)
+                d, i = self._rust.query(gx.points, gx.indptr, gx.indices, ub)
             else:
                 ef_eff = _effective_ef(ef, k, self.n)
-                d, i = self._rust.query_k(gx.points, gx.indptr, gx.indices, k, ef_eff)
+                d, i = self._rust.query_k(gx.points, gx.indptr, gx.indices, k, ef_eff, ub)
             gx_perm = gx.perm
 
         return _finalize_results(
@@ -370,15 +396,13 @@ def _finalize_results(d, i, gx_perm, gy_perm, n_y, k, distance_upper_bound):
     ``gx_perm`` / ``gy_perm`` are the query/target Morton permutations (or
     ``None``); ``n_y`` is the target point count (the missing-neighbour marker).
     """
-    # Undo a target reorder so indices refer to y's original order.
+    # Undo a target reorder so indices refer to y's original order. Extend the
+    # permutation with the miss marker (index n_y) mapping to itself: k>1 rows
+    # carry it as padding, and a bounded k=1 search now emits it too, so the
+    # lookup must stay in bounds for both.
     if gy_perm is not None:
-        if k == 1:
-            i = gy_perm[i]  # target indices -> y's original order
-        else:
-            # k>1 rows may carry the (inf, len(y)) padding marker; extend the
-            # lookup so the marker maps to itself.
-            perm_ext = np.append(gy_perm, n_y)
-            i = perm_ext[i]
+        perm_ext = np.append(gy_perm, n_y)
+        i = perm_ext[i]
     # Undo a query reorder so rows are in x's original order.
     if gx_perm is not None:
         d_out = np.empty_like(d)
@@ -396,6 +420,53 @@ def _finalize_results(d, i, gx_perm, gy_perm, n_y, k, distance_upper_bound):
         i[miss] = n_y
 
     return d, i
+
+
+def _all_miss(n_query, k, n_target, dtype):
+    """Result arrays for a query where every point misses: ``inf`` distances and
+    the ``len(target)`` index marker (scipy's convention), shaped and typed to
+    match :func:`_finalize_results` output.
+    """
+    if k == 1:
+        shape = (n_query,)
+    else:
+        shape = (n_query, k)
+    return (
+        np.full(shape, np.inf, dtype=dtype),
+        np.full(shape, n_target, dtype=np.uint64),
+    )
+
+
+def _box_box_min_dist2(amin, amax, bmin, bmax):
+    """Squared minimum distance between two axis-aligned boxes (0 if they
+    overlap). Computed in float64 so the (search-dtype) box corners -- which
+    bound their clouds exactly -- give a separation with no extra rounding, and
+    thus never prune a cloud that has a real neighbour in range.
+    """
+    amax = np.asarray(amax, dtype=np.float64)
+    amin = np.asarray(amin, dtype=np.float64)
+    bmax = np.asarray(bmax, dtype=np.float64)
+    bmin = np.asarray(bmin, dtype=np.float64)
+    gap = np.maximum(np.maximum(bmin - amax, amin - bmax), 0.0)
+    return float(gap @ gap)
+
+
+def _box_box_short_circuit(x, target_bbox, ub, k, n_target, dtype):
+    """All-miss result if the raw query cloud ``x`` is wholly beyond ``ub`` from
+    the target box, else ``None`` (fall through to the normal search). Boxes are
+    taken in the search dtype -- the same points the descent uses -- so the
+    decision matches Rust's per-point pruning and can never drop a real hit.
+    """
+    if isinstance(x, _DELAUNAY_TYPES):
+        pts = np.asarray(x.points)
+    else:
+        pts = np.asarray(x)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        return None  # malformed; let the normal path raise as usual
+    pts = pts.astype(dtype, copy=False)
+    if _box_box_min_dist2(pts.min(0), pts.max(0), target_bbox[0], target_bbox[1]) > ub * ub:
+        return _all_miss(len(pts), k, n_target, dtype)
+    return None
 
 
 def _cloud_dtype(obj):
