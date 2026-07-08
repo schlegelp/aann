@@ -21,7 +21,7 @@ permissions:
 jobs:
   # Not maturin-generated: proves the crate works as a plain Rust library
   # (default features = no pyo3/numpy) and stays publishable to crates.io.
-  # rustup picks up the nightly toolchain from rust-toolchain.toml.
+  # Builds on stable Rust (SIMD via the `wide` crate).
   rust:
     runs-on: ubuntu-latest
     steps:

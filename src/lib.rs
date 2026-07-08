@@ -4,8 +4,8 @@
 //! form (e.g. the vertex adjacency of a Delaunay triangulation, see
 //! [`graph_from_simplices`]), this crate finds for every point of the query
 //! cloud its (approximate) nearest neighbour(s) in the target cloud via a
-//! warm-started greedy graph descent. Distances are SIMD-accelerated, which is
-//! why the crate requires a **nightly** toolchain (`portable_simd`).
+//! warm-started greedy graph descent. Distances are SIMD-accelerated via the
+//! [`wide`] crate, so the crate builds on stable Rust.
 //!
 //! The Python bindings live behind the non-default `python` cargo feature;
 //! with default features this is a pure-Rust library.
@@ -28,11 +28,8 @@
 //! assert_eq!(idxs.to_vec(), vec![0, 1]);
 //! assert!((dists[0] - 0.1).abs() < 1e-12);
 //! ```
-#![feature(portable_simd)]
-
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
-use core::simd::prelude::{f32x4, f64x4};
-use std::simd::num::SimdFloat;
+use wide::{f32x4, f64x4};
 use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -94,7 +91,7 @@ macro_rules! impl_ann_for {
         pub fn $pack(points: ArrayView2<$t>) -> Vec<$simd> {
             let mut packed: Vec<$simd> = Vec::with_capacity(points.nrows());
             for p in points.outer_iter() {
-                packed.push(<$simd>::from_array([p[0], p[1], p[2], 0.0]));
+                packed.push(<$simd>::from([p[0], p[1], p[2], 0.0]));
             }
             packed
         }
@@ -102,8 +99,8 @@ macro_rules! impl_ann_for {
         /// Squared euclidean distance between two packed points.
         #[inline]
         pub fn $dist(a: &$simd, b: &$simd) -> $t {
-            let diff = a - b;
-            (diff * diff).reduce_sum()
+            let diff = *a - *b;
+            (diff * diff).reduce_add()
         }
 
         /// Neighbour indices of `vertex`, as a zero-copy slice.

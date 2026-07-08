@@ -94,9 +94,8 @@ Delaunay graph).
 ## Using from Rust
 
 The core search is a plain Rust library — the Python bindings sit behind the
-non-default `python` cargo feature. It requires a **nightly** toolchain
-(`portable_simd`), so add a `rust-toolchain.toml` with `channel = "nightly"` to
-your project, then:
+non-default `python` cargo feature. It builds on **stable** Rust (SIMD comes
+from the [`wide`](https://crates.io/crates/wide) crate):
 
 ```toml
 [dependencies]
@@ -165,20 +164,10 @@ Requires **Python ≥ 3.10**. The extension is built against the stable ABI
 3. Run `maturin build --release` to build a wheel or use `maturin develop` to compile and install in development mode
 
 ### SIMD
-`aann` makes use of `core::simd` module which means:
+`aann` uses the [`wide`](https://crates.io/crates/wide) crate for SIMD, which
+works on stable Rust. One thing to be aware of:
 
-1. You need to use the nightly build:
-
-    ```bash
-    # Install and update nightly
-    rustup install nightly
-    rustup update nightly
-    # Make sure you are in project directory
-    cd aann
-    # Tell the project to use nightly
-    rustup override set nightly
-    ```
-2. By default, only the oldest SIMD extension `ssse2` is enabled during compilation. It is very likely that your processor supports newer extensions such as `avx2` or even `avx512f`. To check what's supported run:
+1. By default, only the oldest SIMD extension `sse2` is enabled during compilation (on x86-64). It is very likely that your processor supports newer extensions such as `avx2` or even `avx512f`. To check what's supported run:
     ```bash
     $ cargo install cargo-simd-detect --force
     $ cargo simd-detect
