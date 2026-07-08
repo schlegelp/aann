@@ -151,10 +151,9 @@ this uniform data. Reproduce with `python bench.py`.
 - [x] use SIMD (singe instruction multiple data) for distance calculations
 - [x] implement k-all-nearest neighbors (`k>1` uses an approximate best-first search; recall tunable via `ef`)
 - [x] benchmarks
-- [-] test various neighborhood graphs
-- [-] see if we can immplement additional parameters (done: `distance_upper_bound`; maybe a `distance_lower_bound` if that's useful)
+- [ ] test other neighborhood graphs (e.g. Gabriel, relative neighborhood, etc.) and compare performance/recall
 - [ ] implement `query_radius` (analagous to `scipy.spatial.cKDTree.query_ball_tree`)
-- [ ] implement alternative distance metrics (currently only Euclidean)
+- [ ] add alternative distance metrics (currently only Euclidean)
 - [ ] generalize to N-dimensions (currently only 3D)
 
 ## Build
