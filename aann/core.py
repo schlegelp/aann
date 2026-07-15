@@ -1,6 +1,6 @@
 import os
 
-from collections import namedtuple
+from collections import namedtuple, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -15,6 +15,7 @@ __all__ = [
     "AANN",
     "prepare_many",
     "all_by_all",
+    "all_by_all_grouped",
 ]
 
 # Precomputed-triangulation types accepted anywhere a raw cloud is: scipy's
@@ -130,7 +131,8 @@ class AANN:
             self._rust = _aann.PreparedF64(g.points, g.indptr, g.indices)
 
     def query(self, x, k=1, distance_upper_bound=None, ef=None,
-              graph="delaunay", graph_k=16, backend="shull"):
+              graph="delaunay", graph_k=16, backend="shull",
+              blocked=False, block=8):
         """For each point of ``x`` find its k nearest neighbour(s) in the target.
 
         Parameters
@@ -170,6 +172,34 @@ class AANN:
         graph, graph_k, backend :
                 How a raw-array / ``Delaunay`` ``x`` is triangulated (see the
                 constructor). Ignored when ``x`` is an ``AANN``.
+        blocked : bool
+                Opt into the *blocked/batched* descent (experimental). It processes
+                query points in blocks so that query points sharing a target vertex
+                have that vertex's neighbours gathered once and reused -- roughly
+                ~1.4x faster on the descent, memory-bandwidth bound. Results are
+                **identical** to the default path (k=1 is exact on a Delaunay graph
+                regardless of the descent's start), up to occasional exact-distance
+                ties in the returned *index*. Only takes effect on the fast
+                prepared-vs-prepared ``k=1`` path (``x`` is an ``AANN``); it is
+                silently ignored for ``k>1``, raw/``Delaunay`` ``x`` -- those use the
+                standard path. ``distance_upper_bound`` is supported. Default False.
+
+                **Assumes the query points are stored in Morton-coherent order** --
+                the block carries a single warm seed, so it relies on consecutive
+                query points being spatial neighbours. ``AANN`` builds indices with
+                cache-locality reordering by default (``reorder=True``), so this
+                holds here. A caller that keeps points in their original order (e.g.
+                to align external per-point data) can get a *worse-than-1x* result
+                from a poor warm start; for that case Morton-sort the queries first,
+                or use :func:`all_by_all_grouped` (which sorts internally).
+        block : int
+                Block size for ``blocked`` (query points per batch). Ignored unless
+                ``blocked``. Larger blocks give more gather reuse but share one warm
+                seed across more points; the useful range is ~8-32 (peak ~8-16) and
+                is data- and order-dependent. Default 8. (For a whole all-by-all the
+                grouped path
+                :func:`all_by_all_grouped`, which Morton-sorts across all queries,
+                favours larger blocks ~32-128.)
 
         Returns
         -------
@@ -197,7 +227,14 @@ class AANN:
                     f"({x.dtype} vs {self.dtype})"
                 )
             if k == 1:
-                d, i = self._rust.query_prepared(x._rust, ub)
+                # Blocked/batched descent (opt-in prototype): reuses each target
+                # vertex's neighbour gather across a block of query points. Supports
+                # distance_upper_bound; only the prepared-vs-prepared k=1 path is
+                # blocked, every other case uses the standard path (no regression).
+                if blocked:
+                    d, i = self._rust.query_prepared_blocked(x._rust, block, ub)
+                else:
+                    d, i = self._rust.query_prepared(x._rust, ub)
             else:
                 ef_eff = _effective_ef(ef, k, self.n)
                 d, i = self._rust.query_prepared_k(x._rust, k, ef_eff, ub)
@@ -283,7 +320,7 @@ def prepare_many(clouds, graph="delaunay", graph_k=16, reorder=True, dtype=None,
 
 
 def all_by_all(anns, pairs=None, workers=None, k=1, distance_upper_bound=None,
-               ef=None):
+               ef=None, blocked=False, block=8):
     """Nearest-neighbour join for many :class:`AANN` pairs, in parallel.
 
     The Rust search releases the GIL, so independent pairs run concurrently on a
@@ -311,6 +348,16 @@ def all_by_all(anns, pairs=None, workers=None, k=1, distance_upper_bound=None,
               with no neighbour within the bound.
     ef :      None | int
               Search breadth for k>1 (see :meth:`AANN.query`).
+    blocked : bool
+              Use the blocked/batched descent for each pair (see the ``blocked``
+              argument of :meth:`AANN.query`): ~1.4x faster on the descent, exact,
+              ``k=1`` only. Default False. For a bigger, structural speedup on a
+              *whole* all-by-all prefer :func:`all_by_all_grouped`, which shares
+              gathers across all query neurons of a target and parallelises more
+              coarsely.
+    block :   int
+              Block size for ``blocked`` (default 8; useful range ~8-32, see
+              :meth:`AANN.query`).
 
     Returns
     -------
@@ -340,6 +387,7 @@ def all_by_all(anns, pairs=None, workers=None, k=1, distance_upper_bound=None,
         i, j = pair
         return anns[j].query(
             anns[i], k=k, distance_upper_bound=distance_upper_bound, ef=ef,
+            blocked=blocked, block=block,
         )
 
     if workers <= 1 or len(pairs) <= 1:
@@ -347,6 +395,142 @@ def all_by_all(anns, pairs=None, workers=None, k=1, distance_upper_bound=None,
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         return list(pool.map(_one, pairs))
+
+
+def all_by_all_grouped(anns, pairs=None, workers=None, distance_upper_bound=None,
+                       block=32):
+    """Grouped all-by-all (experimental; k=1 only).
+
+    Equivalent output to :func:`all_by_all` (``k=1``) -- one ``(distances, indices)``
+    per entry in ``pairs``, same order -- but organised so that **all** query clouds'
+    points are concatenated and Morton-sorted **once** into a single grouped query
+    set, which is then descended against **each target** in one blocked pass.
+    Spatially-adjacent query points from *different* neurons fall in the same block
+    and share a single gather of each target vertex's neighbours -- the cross-pair
+    reuse that a pair-at-a-time loop (and the hardware cache) cannot exploit.
+
+    The key is that the concatenation + Morton sort are **target-independent**, so
+    they run a single time up front (in Rust, GIL released) rather than once per
+    target; each per-target call then only descends + finalizes (mapping back to
+    each operand's original point/index order, also in Rust). Python only slices the
+    result. Output is **identical** to :func:`all_by_all` (up to exact-distance ties
+    in the returned index).
+
+    Parameters
+    ----------
+    anns, pairs, workers, distance_upper_bound :
+              As in :func:`all_by_all`. (No ``k``/``ef``: this is a ``k=1`` path.)
+    block :   int
+              Blocked-descent block size (default 32; see :meth:`AANN.query`). The
+              sweet spot here is ~32-128 and is data-dependent (larger clouds favour
+              larger blocks); ~1.95-2.05x single-thread and ~4x multi-thread over
+              :func:`all_by_all` were measured at block=32 on dense neuron data.
+
+    Returns
+    -------
+    list of (distances, indices)
+        One ``(d, i)`` per entry in ``pairs``, in the same order -- identical to
+        ``all_by_all(..., k=1)``.
+
+    Notes
+    -----
+    This is the fastest path for a large multi-threaded all-by-all, but it does
+    **not** scale identically to :func:`all_by_all` -- keep these in mind:
+
+    - **k=1 only.** For ``k>1`` use :func:`all_by_all`.
+    - **Descends the whole query set per target.** Each target is queried against
+      *all* clouds' points (the shared grouped set), then only the requested pairs
+      are sliced out. For the default (``pairs=None``, every ``i != j``) this costs
+      only the self-pair extra (~1/N). But for a **sparse custom** ``pairs`` -- few
+      query clouds per target -- it over-computes; there, ``distance_upper_bound``
+      keeps far points cheap (per-point box prune), or prefer
+      ``all_by_all(..., blocked=True)``.
+    - **Memory.** The shared grouped set is one Morton-sorted copy of *all* query
+      points (``O(total points)``), built once; each in-flight target additionally
+      allocates full-length output buffers (``O(total points)``). With ``workers``
+      targets running that is ``workers × O(total points)``. Cap ``workers`` if
+      memory-bound.
+    - **Parallelism is over distinct targets, not pairs.** Great scaling when there
+      are many, similarly-connected targets (coarse GIL-free tasks; the per-pair
+      :func:`all_by_all` scales poorly here due to task-dispatch/GIL overhead). But
+      if ``pairs`` involve few distinct targets it under-uses cores, and a few
+      *hub* targets (near many more neurons than the rest) become straggler tasks.
+    - **The speedup is data-dependent.** The cross-pair gather reuse is largest when
+      many query neurons densely overlap each target; on spatially sparse data it
+      shrinks toward the plain blocked descent. Single-threaded, the plain
+      ``all_by_all(..., blocked=True)`` is simpler and uses less memory for a similar
+      gain; this path's big win is multi-threaded.
+    - **Does not avoid the O(N²) pairs list.** Like :func:`all_by_all` it still needs
+      ``pairs`` enumerated; ``pairs=None`` at very large N is infeasible for both --
+      pre-filter to spatially-near pairs first.
+    """
+    anns = list(anns)
+    for a in anns:
+        if not isinstance(a, AANN):
+            raise TypeError(
+                "all_by_all_grouped expects AANN instances; build them with "
+                f"AANN(...) or prepare_many(...). Got {type(a).__name__}."
+            )
+    if anns and any(a.dtype != anns[0].dtype for a in anns):
+        raise ValueError("all AANN operands must share a dtype")
+
+    n = len(anns)
+    if pairs is None:
+        pairs = [(i, j) for i in range(n) for j in range(n) if i != j]
+    else:
+        pairs = [tuple(p) for p in pairs]
+    if workers is None:
+        workers = os.cpu_count() or 1
+
+    ub = None
+    if distance_upper_bound is not None and distance_upper_bound < np.inf:
+        ub = float(distance_upper_bound)
+
+    results = [None] * len(pairs)
+    if not pairs:
+        return results
+
+    # Each cloud's new->original permutation as int64 (or None), computed ONCE and
+    # reused across every target it queries (a cloud is a query for many targets).
+    perms = [None if a._perm is None else np.ascontiguousarray(a._perm, dtype=np.int64)
+             for a in anns]
+
+    # Build the grouped query handle ONCE for the whole all-by-all: concatenate
+    # every cloud's points and Morton-sort them a single time in Rust. This work
+    # is target-independent, so hoisting it out of the per-target loop is what
+    # keeps the grouped descent fast -- re-sorting per target used to cost ~half
+    # the gain. `gq` is frozen/read-only, shared across the thread pool below.
+    grouped_cls = (_aann.GroupedQueriesF32 if anns[0].dtype == np.dtype(np.float32)
+                   else _aann.GroupedQueriesF64)
+    gq = grouped_cls.prepare([a._rust for a in anns], perms)
+    offsets = np.asarray(gq.offsets)  # (n + 1,); cloud i -> [offsets[i], offsets[i+1])
+
+    # Group the requested pairs by target neuron j.
+    by_target = defaultdict(list)  # j -> list of (pair_index, query_index i)
+    for pidx, (i, j) in enumerate(pairs):
+        by_target[j].append((pidx, i))
+
+    def process_target(j):
+        # Descend the whole (already Morton-sorted) grouped query set against
+        # target j once and finalize to per-cloud ORIGINAL point/index order in
+        # Rust (GIL released). Then slice out the requested query clouds via the
+        # shared offsets. (The full set includes the self-pair and any clouds not
+        # paired with j; those blocks are simply not sliced.)
+        d_flat, i_flat = anns[j]._rust.query_grouped(gq, perms[j], block, ub)
+        d_flat = np.asarray(d_flat)
+        i_flat = np.asarray(i_flat)
+        for (pidx, i) in by_target[j]:
+            a, b = offsets[i], offsets[i + 1]
+            results[pidx] = (d_flat[a:b].copy(), i_flat[a:b].copy())
+
+    targets = list(by_target)
+    if workers <= 1 or len(targets) <= 1:
+        for j in targets:
+            process_target(j)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(process_target, targets))
+    return results
 
 
 def _prepare(cloud, graph="delaunay", graph_k=16, reorder=True, dtype=None,

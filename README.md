@@ -82,6 +82,28 @@ Because a cloud that appears in many pairs is triangulated and packed only once,
 a full all-by-all over *n* clouds does *O(n)* index builds rather than *O(n²)* —
 the reason `aann` suits workloads like NBLAST neuron-vs-neuron matrices.
 
+#### Blocked and grouped descents (faster, `k=1`, experimental)
+
+Two opt-in variants speed up the `k=1` descent without changing the result (they
+are exact up to occasional equal-distance ties in the returned *index*):
+
+```python
+# Blocked: reuse each target vertex's neighbour gather across a block of query
+# points (~1.4x on the descent). Works per query too; supports distance_upper_bound.
+# Assumes Morton-coherent query order (the aann default, reorder=True); a block
+# size in ~8-64 is the useful range.
+d, i = index.query(other_index, blocked=True, block=8)
+results = aann.all_by_all(indexes, blocked=True)
+
+# Grouped: concatenate ALL query neurons' points and Morton-sort them ONCE, then
+# descend that shared set against each target so co-located points from different
+# neurons share gathers. Fastest for a large multi-threaded all-by-all (~4x
+# multi-thread / ~2x single-thread here at block=32); k=1 only. See the docstring
+# for the scaling caveats (memory, parallelism = #targets, data-dependent speedup,
+# and that it descends the whole query set per target).
+results = aann.all_by_all_grouped(indexes, distance_upper_bound=40.0)  # block=32
+```
+
 ### `aann` vs a KD-tree
 
 Unlike a KD-tree, `aann` is a **cloud-vs-cloud** method: the query points are

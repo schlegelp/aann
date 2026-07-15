@@ -123,7 +123,8 @@ impl Default for Workspace {
 macro_rules! impl_ann_for {
     ($t:ty, $simd:ty, $nbhd:ident, $dist:ident, $neigh:ident, $find:ident, $search:ident,
      $search_into:ident, $hitem:ident, $findk:ident, $searchk:ident, $pack:ident, $prepared:ident,
-     $box_dist2:ident, $box_box_dist2:ident, $bbox_of:ident, $resolve_prune:ident, $search_pruned:ident) => {
+     $box_dist2:ident, $box_box_dist2:ident, $bbox_of:ident, $resolve_prune:ident, $search_pruned:ident,
+     $search_blocked:ident, $grouped:ident) => {
         /// A neighborhood graph over `$t` coordinates.
         ///
         /// `indices`/`neighbors` are zero-copy CSR views into the caller's
@@ -284,6 +285,170 @@ macro_rules! impl_ann_for {
                 }
             }
             (d.sqrt(), vertex)
+        }
+
+        /// PROTOTYPE -- blocked/batched k=1 all-nearest-neighbour descent.
+        ///
+        /// Same exact greedy descent as `$find`, but query points are processed in
+        /// contiguous blocks of `block` (they are in Morton order, so a block is
+        /// spatially coherent). Within a block the descent runs in lockstep: each
+        /// round, block members sharing the same current target vertex have that
+        /// vertex's neighbour coordinates **gathered once** into a small local
+        /// buffer and reused for every one of them -- turning the scattered
+        /// `points_simd[n]` fetches (aann's memory bottleneck) into one gather per
+        /// (vertex, round) instead of one per (vertex, query point).
+        ///
+        /// `prune = Some((tmin, tmax, ub, qbox?))` applies a `distance_upper_bound`
+        /// exactly as `$search_into` does (whole-cloud short-circuit, per-point box
+        /// prune, after-descent miss marking `(inf, |y|)`); `None` is unbounded.
+        /// Results are identical to the sequential path point-for-point (k=1 is exact
+        /// on a Delaunay graph regardless of the descent's start vertex); only the
+        /// *order* of gathers differs. Additive prototype -- `$search_into` untouched.
+        pub fn $search_blocked(
+            x: &$nbhd,
+            y: &$nbhd,
+            dists: &mut Vec<$t>,
+            idx: &mut Vec<usize>,
+            block: usize,
+            prune: Option<($simd, $simd, $t, Option<($simd, $simd)>)>,
+        ) {
+            let n_x = x.indices.len() - 1;
+            let n_y = y.points_simd.len();
+            dists.resize(n_x, 0.0);
+            idx.resize(n_x, 0);
+            if n_x == 0 {
+                return;
+            }
+            if n_y == 0 {
+                dists.iter_mut().for_each(|d| *d = <$t>::INFINITY);
+                idx.iter_mut().for_each(|i| *i = 0);
+                return;
+            }
+            let xpts: &[$simd] = &x.points_simd;
+            let ypts: &[$simd] = &y.points_simd;
+            let yindptr: &[usize] = y.indices.as_slice().expect("contiguous CSR indptr");
+            let yneigh: &[usize] = y.neighbors.as_slice().expect("contiguous CSR neighbours");
+
+            // Resolve the bound once (see `$resolve_prune`): None -> unbounded;
+            // Some(None) -> whole query cloud out of range (all misses);
+            // Some(Some((bmin, bmax, ub2, check_points))) -> squared bound plus
+            // whether the per-point box test can ever fire.
+            let prune2 = match $resolve_prune(prune, xpts, n_x) {
+                None => None,
+                Some(None) => {
+                    dists.iter_mut().for_each(|d| *d = <$t>::INFINITY);
+                    idx.iter_mut().for_each(|i| *i = n_y);
+                    return;
+                }
+                Some(Some(p)) => Some(p),
+            };
+
+            let block = block.max(1);
+            // Per-block descent state (recycled across blocks). A pruned member is
+            // flagged with the `usize::MAX` sentinel in `cur` and never descends.
+            let mut cur: Vec<usize> = vec![0; block];
+            let mut curd: Vec<$t> = vec![0.0; block];
+            let mut done: Vec<bool> = vec![false; block];
+            let mut order: Vec<usize> = Vec::with_capacity(block);
+            // Gather buffer for one vertex's neighbour coordinates (reused).
+            let mut coords: Vec<$simd> = Vec::with_capacity(32);
+            let mut nbrs: Vec<usize> = Vec::with_capacity(32);
+
+            let mut seed = 0usize; // warm start carried across blocks
+            let mut b0 = 0usize;
+            while b0 < n_x {
+                let b1 = (b0 + block).min(n_x);
+                let bs = b1 - b0;
+                let mut remaining = 0usize;
+                for k in 0..bs {
+                    let gp = b0 + k;
+                    // Per-point box prune: skip the descent for a query point beyond
+                    // the bound from the whole target box (flag with the sentinel).
+                    let pruned = match prune2 {
+                        Some((bmin, bmax, ub2, true)) => $box_dist2(&bmin, &bmax, &xpts[gp]) > ub2,
+                        _ => false,
+                    };
+                    if pruned {
+                        cur[k] = usize::MAX;
+                        done[k] = true;
+                    } else {
+                        cur[k] = seed;
+                        curd[k] = $dist(&ypts[seed], &xpts[gp]);
+                        done[k] = false;
+                        remaining += 1;
+                    }
+                }
+                while remaining > 0 {
+                    // Group unconverged members by their current target vertex so
+                    // members at the same vertex are handled together (one gather).
+                    order.clear();
+                    for k in 0..bs {
+                        if !done[k] {
+                            order.push(k);
+                        }
+                    }
+                    order.sort_unstable_by_key(|&k| cur[k]);
+                    let mut gi = 0;
+                    while gi < order.len() {
+                        let v = cur[order[gi]];
+                        // Gather vertex v's neighbour coordinates ONCE.
+                        coords.clear();
+                        nbrs.clear();
+                        for &nn in &yneigh[yindptr[v]..yindptr[v + 1]] {
+                            coords.push(ypts[nn]);
+                            nbrs.push(nn);
+                        }
+                        // Advance every block member currently at v from `coords`.
+                        let mut gj = gi;
+                        while gj < order.len() && cur[order[gj]] == v {
+                            let k = order[gj];
+                            let p = &xpts[b0 + k];
+                            let mut best = curd[k];
+                            let mut bestj = usize::MAX;
+                            for (j, c) in coords.iter().enumerate() {
+                                let dn = $dist(c, p);
+                                if dn < best {
+                                    best = dn;
+                                    bestj = j;
+                                }
+                            }
+                            if bestj != usize::MAX {
+                                cur[k] = nbrs[bestj];
+                                curd[k] = best;
+                            } else {
+                                done[k] = true;
+                                remaining -= 1;
+                            }
+                            gj += 1;
+                        }
+                        gi = gj;
+                    }
+                }
+                // Write results; mark misses (pruned, or NN beyond the bound) as
+                // (inf, |y|). Advance the warm seed only onto a genuine in-range hit
+                // (a miss keeps the previous seed, mirroring `$search_into`).
+                for k in 0..bs {
+                    let gp = b0 + k;
+                    if cur[k] == usize::MAX {
+                        dists[gp] = <$t>::INFINITY;
+                        idx[gp] = n_y;
+                        continue;
+                    }
+                    let miss = match prune2 {
+                        Some((_, _, ub2, _)) => curd[k] > ub2,
+                        None => false,
+                    };
+                    if miss {
+                        dists[gp] = <$t>::INFINITY;
+                        idx[gp] = n_y;
+                    } else {
+                        dists[gp] = curd[k].sqrt();
+                        idx[gp] = cur[k];
+                        seed = cur[k];
+                    }
+                }
+                b0 = b1;
+            }
         }
 
         /// Buffer-reuse form of `$search`: writes each query point's nearest
@@ -774,6 +939,113 @@ macro_rules! impl_ann_for {
                 $search_into(&other.as_graph(), &self.as_graph(), ws, dists, idx, self.prune(ub, qbox));
             }
 
+            /// PROTOTYPE: blocked/batched counterpart to `query_prepared` (see
+            /// `$search_blocked`). `ub` applies a `distance_upper_bound` just like
+            /// `query_prepared`; results match it point-for-point. `block` is the
+            /// query-point block size (gather-reuse granularity).
+            pub fn query_prepared_blocked(
+                &self,
+                other: &Self,
+                block: usize,
+                ub: Option<$t>,
+            ) -> (Array1<$t>, Array1<usize>) {
+                let qbox = Some((other.bbox_min, other.bbox_max));
+                let mut dists: Vec<$t> = Vec::new();
+                let mut idx: Vec<usize> = Vec::new();
+                $search_blocked(
+                    &other.as_graph(), &self.as_graph(), &mut dists, &mut idx, block,
+                    self.prune(ub, qbox),
+                );
+                (Array1::from(dists), Array1::from(idx))
+            }
+
+            /// Blocked descent of a prepared grouped query set (see `$grouped`)
+            /// against this target. The concat + Morton sort were done ONCE in
+            /// `$grouped::prepare` and are reused across every target, so the
+            /// target-independent prep is never repeated per target -- the fix for
+            /// the per-target re-sort that used to halve the grouped win.
+            ///
+            /// The whole grouped set is descended (rely on `ub`'s per-point box
+            /// prune to keep far points cheap); the caller slices out the pairs it
+            /// wants via `$grouped::cloud_span`. `ub` is as in `query_prepared`.
+            ///
+            /// `finalize = true` (aann's own use): un-sort Morton -> concatenated
+            /// order, map to each cloud's original point order (via the perms stored
+            /// in `gq`) and target indices to original (via `target_perm`); returns
+            /// flat `(dists, idx)` in concatenated per-cloud ORIGINAL order with
+            /// ORIGINAL target indices -- the caller only slices. `finalize = false`:
+            /// return the raw results in `gq`'s Morton order with this target's
+            /// INTERNAL indices; the caller maps them via `gq.perm()` (skips the
+            /// per-target scatter -- useful when the consumer iterates points anyway).
+            pub fn query_grouped(
+                &self,
+                gq: &$grouped,
+                target_perm: Option<&[i64]>,
+                block: usize,
+                ub: Option<$t>,
+                finalize: bool,
+            ) -> (Array1<$t>, Array1<usize>) {
+                let n_y = self.points_simd.len();
+                let n = gq.sorted.len();
+                if n == 0 {
+                    return (Array1::from(Vec::<$t>::new()), Array1::from(Vec::<usize>::new()));
+                }
+                // Descend the (already Morton-sorted) grouped points once. Dummy
+                // query CSR: the blocked descent walks points in order, never a
+                // query adjacency. Borrow the sorted points (no per-target copy).
+                let indptr: Vec<usize> = vec![0usize; n + 1];
+                let neighbors: Vec<usize> = Vec::new();
+                let x = $nbhd::new(
+                    Cow::Borrowed(gq.sorted.as_slice()),
+                    ArrayView1::from(indptr.as_slice()),
+                    ArrayView1::from(neighbors.as_slice()),
+                );
+                let mut ds: Vec<$t> = Vec::new();
+                let mut is_: Vec<usize> = Vec::new();
+                $search_blocked(&x, &self.as_graph(), &mut ds, &mut is_, block, self.prune(ub, None));
+
+                if !finalize {
+                    // Raw Morton-order results with target-internal indices. The
+                    // caller un-sorts via `gq.perm()` and maps target indices itself.
+                    return (Array1::from(ds), Array1::from(is_));
+                }
+
+                // Un-sort Morton -> concatenated (per-cloud internal) order.
+                let mut dist_int: Vec<$t> = vec![0.0 as $t; n];
+                let mut idx_int: Vec<usize> = vec![0usize; n];
+                for (k, &orig) in gq.perm.iter().enumerate() {
+                    dist_int[orig] = ds[k];
+                    idx_int[orig] = is_[k];
+                }
+                // Finalize: per cloud, scatter internal->original point order (query
+                // side) and map target indices internal->original (mirrors the old
+                // Python `_finalize_results`, run here with the GIL released).
+                let mut dist_out: Vec<$t> = vec![0.0 as $t; n];
+                let mut idx_out: Vec<usize> = vec![0usize; n];
+                for c in 0..gq.offsets.len() - 1 {
+                    let off = gq.offsets[c];
+                    let nc = gq.offsets[c + 1] - off;
+                    let qperm = gq.query_perms.get(c).and_then(|o| o.as_deref());
+                    for k in 0..nc {
+                        let src = off + k;
+                        // k-th internal query point -> its original index within cloud c
+                        let dst = off + match qperm {
+                            Some(p) => p[k] as usize,
+                            None => k,
+                        };
+                        dist_out[dst] = dist_int[src];
+                        let ti = idx_int[src];
+                        idx_out[dst] = match target_perm {
+                            Some(tp) if ti < n_y => tp[ti] as usize,
+                            Some(_) => n_y, // miss marker maps to itself
+                            None => ti,
+                        };
+                    }
+                }
+                (Array1::from(dist_out), Array1::from(idx_out))
+            }
+
+
             /// Buffer-reuse form of `query`: recycles the output buffers, the
             /// DFS scratch `ws`, and the SIMD-pack scratch `pack`. The query
             /// cloud must still be packed (into the reused `pack` buffer, which
@@ -817,16 +1089,161 @@ macro_rules! impl_ann_for {
                 arr
             }
         }
+
+        /// A reusable, Morton-sorted concatenation of many query clouds' points,
+        /// built ONCE for a whole all-by-all and descended against each target with
+        /// `$prepared::query_grouped`. The concat + Morton sort are target-
+        /// independent, so hoisting them here (instead of redoing them per target)
+        /// is what lets the grouped descent keep its ~2x single-thread / ~4x multi-
+        /// thread gain rather than spending ~half its time re-sorting per target.
+        ///
+        /// Read-only after construction, so one instance can be shared across
+        /// threads while the GIL is released.
+        pub struct $grouped {
+            /// Morton-sorted concatenated query points (across all clouds).
+            sorted: Vec<$simd>,
+            /// sorted position -> concatenated (pre-sort) index.
+            perm: Vec<usize>,
+            /// cloud `c` occupies `[offsets[c], offsets[c + 1])` in concatenated order.
+            offsets: Vec<usize>,
+            /// each cloud's new->original point permutation (or `None` if the cloud
+            /// was not reordered); used by the `finalize` step of `query_grouped`.
+            query_perms: Vec<Option<Vec<i64>>>,
+        }
+
+        impl $grouped {
+            /// Concatenate every cloud's internal points and Morton-sort the whole
+            /// set ONCE. `query_perms[c]` is cloud `c`'s new->original permutation
+            /// (`None` = identity / not reordered); its length must match `queries`.
+            /// Target-independent: build once per all-by-all, reuse for every target.
+            pub fn prepare(queries: &[&$prepared], query_perms: &[Option<&[i64]>]) -> Self {
+                let n_clouds = queries.len();
+                let mut offsets: Vec<usize> = Vec::with_capacity(n_clouds + 1);
+                offsets.push(0);
+                let total: usize = queries.iter().map(|q| q.points_simd.len()).sum();
+                let mut all: Vec<$simd> = Vec::with_capacity(total);
+                for q in queries {
+                    all.extend_from_slice(&q.points_simd);
+                    offsets.push(all.len());
+                }
+                let n = all.len();
+                let (sorted, perm) = if n == 0 {
+                    (Vec::new(), Vec::new())
+                } else {
+                    // Morton-sort the combined points (interleaves the clouds
+                    // spatially so co-located points from different clouds share
+                    // a block, and thus one target-vertex gather).
+                    let coords: Vec<[f64; 3]> = all
+                        .iter()
+                        .map(|p| {
+                            let a = p.to_array();
+                            [a[0] as f64, a[1] as f64, a[2] as f64]
+                        })
+                        .collect();
+                    let perm = morton_perm(&coords);
+                    let sorted: Vec<$simd> = perm.iter().map(|&i| all[i]).collect();
+                    (sorted, perm)
+                };
+                let query_perms_owned: Vec<Option<Vec<i64>>> =
+                    query_perms.iter().map(|o| o.map(|s| s.to_vec())).collect();
+                $grouped { sorted, perm, offsets, query_perms: query_perms_owned }
+            }
+
+            /// Number of concatenated query points.
+            pub fn n_points(&self) -> usize {
+                self.sorted.len()
+            }
+
+            /// Number of query clouds.
+            pub fn n_clouds(&self) -> usize {
+                self.offsets.len() - 1
+            }
+
+            /// Cloud `c`'s span `[start, end)` in the concatenated per-cloud order
+            /// that `query_grouped(finalize = true)` returns -- the caller slices
+            /// each pair's result out with this.
+            pub fn cloud_span(&self, c: usize) -> (usize, usize) {
+                (self.offsets[c], self.offsets[c + 1])
+            }
+
+            /// The `(n_clouds + 1,)` cloud offsets: cloud `c`'s span is
+            /// `[offsets[c], offsets[c + 1])`. Exposed so a caller can slice out
+            /// each pair's block from the flat `query_grouped(finalize = true)`
+            /// result without re-deriving the concatenation order.
+            pub fn offsets(&self) -> &[usize] {
+                &self.offsets
+            }
+
+            /// The sorted-position -> concatenated-index permutation, for a caller
+            /// that uses `query_grouped(finalize = false)` and un-sorts itself.
+            pub fn perm(&self) -> &[usize] {
+                &self.perm
+            }
+        }
     };
 }
 
 impl_ann_for!(f64, f64x4, NeighborhoodF64, euclidean_distance_f64, get_neighbours_f64, find_nn_f64, search_f64,
               search_into_f64, HeapItemF64, find_knn_f64, search_k_f64, pack_points_f64, PreparedF64,
-              box_dist2_f64, box_box_dist2_f64, bbox_of_f64, resolve_prune_f64, search_pruned_f64);
+              box_dist2_f64, box_box_dist2_f64, bbox_of_f64, resolve_prune_f64, search_pruned_f64,
+              search_blocked_f64, GroupedQueriesF64);
 // f32 variant: half the memory traffic per point, some precision loss.
 impl_ann_for!(f32, f32x4, NeighborhoodF32, euclidean_distance_f32, get_neighbours_f32, find_nn_f32, search_f32,
               search_into_f32, HeapItemF32, find_knn_f32, search_k_f32, pack_points_f32, PreparedF32,
-              box_dist2_f32, box_box_dist2_f32, bbox_of_f32, resolve_prune_f32, search_pruned_f32);
+              box_dist2_f32, box_box_dist2_f32, bbox_of_f32, resolve_prune_f32, search_pruned_f32,
+              search_blocked_f32, GroupedQueriesF32);
+
+/// Spread the low 21 bits of `v` to every 3rd bit (Morton/Z-order interleave for
+/// one axis). Matches the bit magic in the Python `_morton_perm`, so the Rust and
+/// Python spatial sorts agree (they need not, but consistency is convenient).
+#[inline]
+fn spread21(v: u64) -> u64 {
+    let mut v = v & 0x1F_FFFF;
+    v = (v | (v << 32)) & 0x1F00000000FFFF;
+    v = (v | (v << 16)) & 0x1F0000FF0000FF;
+    v = (v | (v << 8)) & 0x100F00F00F00F00F;
+    v = (v | (v << 4)) & 0x10C30C30C30C30C3;
+    v = (v | (v << 2)) & 0x1249249249249249;
+    v
+}
+
+/// Argsort points into Morton (Z-order) so spatially-near points are adjacent.
+/// Returns `perm` with `perm[k]` = original index of the k-th point in Z-order.
+/// Used by the per-target grouped descent to interleave many query clouds so
+/// co-located points (from different clouds) share a block -- and thus one gather.
+pub fn morton_perm(pts: &[[f64; 3]]) -> Vec<usize> {
+    let n = pts.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut mn = [f64::INFINITY; 3];
+    let mut mx = [f64::NEG_INFINITY; 3];
+    for p in pts {
+        for a in 0..3 {
+            mn[a] = mn[a].min(p[a]);
+            mx[a] = mx[a].max(p[a]);
+        }
+    }
+    let mut span = [0.0f64; 3];
+    for a in 0..3 {
+        span[a] = mx[a] - mn[a];
+        if span[a] == 0.0 {
+            span[a] = 1.0;
+        }
+    }
+    let scale = ((1u64 << 21) - 1) as f64;
+    let mut codes: Vec<(u64, usize)> = Vec::with_capacity(n);
+    for (i, p) in pts.iter().enumerate() {
+        let mut code = 0u64;
+        for a in 0..3 {
+            let q = ((((p[a] - mn[a]) / span[a]) * scale) as u64) & 0x1F_FFFF;
+            code |= spread21(q) << a;
+        }
+        codes.push((code, i));
+    }
+    codes.sort_unstable_by_key(|&(c, _)| c);
+    codes.into_iter().map(|(_, i)| i).collect()
+}
 
 /// Build a vertex-adjacency CSR graph from Delaunay tetrahedra.
 ///

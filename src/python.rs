@@ -9,7 +9,8 @@ use std::borrow::Cow;
 
 use crate::{
     pack_points_f32, pack_points_f64, search_f32, search_f64, search_k_f32, search_k_f64,
-    NeighborhoodF32, NeighborhoodF64, PreparedF32, PreparedF64,
+    GroupedQueriesF32, GroupedQueriesF64, NeighborhoodF32, NeighborhoodF64, PreparedF32,
+    PreparedF64,
 };
 
 /// Generate the Python bindings for one coordinate type: the per-call
@@ -27,9 +28,13 @@ use crate::{
 ///  `$pyfnk`    generated k>1 `#[pyfunction]` name exposed to Python
 ///  `$pywrap`   generated pyclass newtype wrapping `$prepared`
 ///  `$pyname`   Python-visible class name (string literal)
+///  `$grouped`  core reusable grouped-query struct (`GroupedQueries*`)
+///  `$pygrouped` generated pyclass newtype wrapping `$grouped`
+///  `$pygroupedname` Python-visible grouped-query class name (string literal)
 macro_rules! impl_py_ann_for {
     ($t:ty, $nbhd:ident, $pack:ident, $search:ident, $searchk:ident, $prepared:ident,
-     $pyfn:ident, $pyfnk:ident, $pywrap:ident, $pyname:literal) => {
+     $pyfn:ident, $pyfnk:ident, $pywrap:ident, $pyname:literal,
+     $grouped:ident, $pygrouped:ident, $pygroupedname:literal) => {
         /// Find, for each point in `x`, the nearest neighbour among points in `y`
         /// (both given as neighbourhood graphs). The heavy search runs with the
         /// GIL released, so independent calls (e.g. an all-by-all join driven
@@ -202,6 +207,61 @@ macro_rules! impl_py_ann_for {
                 Ok((distances.into_pyarray(py), indices.into_pyarray(py)))
             }
 
+            /// PROTOTYPE: blocked/batched descent (see core `query_prepared_blocked`).
+            /// `distance_upper_bound` is as in `query_prepared`; identical results.
+            /// `block` = query-point block size (gather reuse granularity).
+            #[pyo3(signature = (other, block=8, distance_upper_bound=None))]
+            fn query_prepared_blocked<'py>(
+                &self,
+                py: Python<'py>,
+                other: PyRef<'py, $pywrap>,
+                block: usize,
+                distance_upper_bound: Option<$t>,
+            ) -> PyResult<(Bound<'py, PyArray1<$t>>, Bound<'py, PyArray1<usize>>)> {
+                let q: &$prepared = &other.0;
+                let (distances, indices) =
+                    py.detach(move || self.0.query_prepared_blocked(q, block, distance_upper_bound));
+
+                Ok((distances.into_pyarray(py), indices.into_pyarray(py)))
+            }
+
+            /// Blocked descent of a prepared grouped query set (a `$pygroupedname`
+            /// built once via `$pygroupedname.prepare`) against this target -- see
+            /// core `query_grouped`. The concat + Morton sort were hoisted into
+            /// `prepare`, so this only descends + finalizes (GIL released), and the
+            /// same handle is reused for every target without re-sorting.
+            ///
+            /// `finalize=True` returns flat `(dists, idx)` in concatenated per-cloud
+            /// ORIGINAL order (slice each pair out via the handle's `offsets`) with
+            /// ORIGINAL target indices (mapped via `target_perm`). `finalize=False`
+            /// returns raw results in the handle's Morton order with this target's
+            /// INTERNAL indices; the caller maps them itself via the handle's `perm`.
+            /// `target_perm` is this target's new->original int64 permutation (or
+            /// None). `distance_upper_bound` is as in `query_prepared`.
+            #[pyo3(signature = (grouped, target_perm, block=32, distance_upper_bound=None, finalize=true))]
+            fn query_grouped<'py>(
+                &self,
+                py: Python<'py>,
+                grouped: PyRef<'py, $pygrouped>,
+                target_perm: Option<PyReadonlyArray1<'py, i64>>,
+                block: usize,
+                distance_upper_bound: Option<$t>,
+                finalize: bool,
+            ) -> PyResult<(Bound<'py, PyArray1<$t>>, Bound<'py, PyArray1<usize>>)> {
+                let gq: &$grouped = &grouped.0;
+                // Borrow the target permutation as a slice (GIL held); valid for the
+                // scoped `detach` below, like the point arrays elsewhere.
+                let tp_array = target_perm.as_ref().map(|a| a.as_array());
+                let tp: Option<&[i64]> =
+                    tp_array.as_ref().map(|a| a.as_slice().expect("contiguous target perm"));
+
+                let (distances, indices) = py.detach(move || {
+                    self.0.query_grouped(gq, tp, block, distance_upper_bound, finalize)
+                });
+
+                Ok((distances.into_pyarray(py), indices.into_pyarray(py)))
+            }
+
             /// Number of points in the prepared target.
             #[getter]
             fn n(&self) -> usize {
@@ -218,15 +278,90 @@ macro_rules! impl_py_ann_for {
                 format!("{}(n={})", $pyname, self.0.n())
             }
         }
+
+        /// The pyclass counterpart to the core `$grouped`: a Morton-sorted
+        /// concatenation of many query clouds' points, built ONCE via `prepare`
+        /// and descended against each target with `$pyname.query_grouped`.
+        /// Frozen (read-only) so one instance can be shared across a thread pool
+        /// while each `query_grouped` runs with the GIL released.
+        #[pyclass(frozen, name = $pygroupedname)]
+        struct $pygrouped($grouped);
+
+        #[pymethods]
+        impl $pygrouped {
+            /// Concatenate + Morton-sort every query cloud's points ONCE (GIL
+            /// released). `queries` are prepared targets used as query operands;
+            /// `query_perms[c]` is cloud `c`'s new->original int64 permutation
+            /// (or None if that cloud was not reordered). Build one of these per
+            /// all-by-all and pass it to `query_grouped` for every target.
+            #[staticmethod]
+            #[pyo3(signature = (queries, query_perms))]
+            fn prepare<'py>(
+                py: Python<'py>,
+                queries: Vec<PyRef<'py, $pywrap>>,
+                query_perms: Vec<Option<PyReadonlyArray1<'py, i64>>>,
+            ) -> Self {
+                let qs: Vec<&$prepared> = queries.iter().map(|q| &q.0).collect();
+                // Borrow the permutation arrays as slices (GIL held); `prepare`
+                // copies them, so they need only outlive the scoped `detach`.
+                let qp_arrays: Vec<Option<_>> =
+                    query_perms.iter().map(|o| o.as_ref().map(|a| a.as_array())).collect();
+                let qp: Vec<Option<&[i64]>> = qp_arrays
+                    .iter()
+                    .map(|o| o.as_ref().map(|a| a.as_slice().expect("contiguous perm")))
+                    .collect();
+                let g = py.detach(move || $grouped::prepare(&qs, &qp));
+                $pygrouped(g)
+            }
+
+            /// Number of concatenated query points.
+            #[getter]
+            fn n_points(&self) -> usize {
+                self.0.n_points()
+            }
+
+            /// Number of query clouds.
+            #[getter]
+            fn n_clouds(&self) -> usize {
+                self.0.n_clouds()
+            }
+
+            /// The `(n_clouds + 1,)` cloud offsets: cloud `c`'s block in a
+            /// `query_grouped(finalize=True)` result is `[offsets[c], offsets[c+1])`.
+            #[getter]
+            fn offsets<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<usize>> {
+                self.0.offsets().to_vec().into_pyarray(py)
+            }
+
+            /// The sorted-position -> concatenated-index permutation `(n_points,)`.
+            /// Only needed with `query_grouped(finalize=False)`: scatter the raw
+            /// Morton-order results back to concatenated order with
+            /// `out[perm] = raw`, then slice per cloud via `offsets`.
+            #[getter]
+            fn perm<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<usize>> {
+                self.0.perm().to_vec().into_pyarray(py)
+            }
+
+            fn __repr__(&self) -> String {
+                format!(
+                    "{}(n_clouds={}, n_points={})",
+                    $pygroupedname,
+                    self.0.n_clouds(),
+                    self.0.n_points()
+                )
+            }
+        }
     };
 }
 
 // f64 keeps the original `all_nearest_neighbours` name (backward compatible).
 impl_py_ann_for!(f64, NeighborhoodF64, pack_points_f64, search_f64, search_k_f64, PreparedF64,
-                 all_nearest_neighbours, all_nearest_neighbours_k, PyPreparedF64, "PreparedF64");
+                 all_nearest_neighbours, all_nearest_neighbours_k, PyPreparedF64, "PreparedF64",
+                 GroupedQueriesF64, PyGroupedQueriesF64, "GroupedQueriesF64");
 // f32 variant: half the memory traffic per point, some precision loss.
 impl_py_ann_for!(f32, NeighborhoodF32, pack_points_f32, search_f32, search_k_f32, PreparedF32,
-                 all_nearest_neighbours_f32, all_nearest_neighbours_k_f32, PyPreparedF32, "PreparedF32");
+                 all_nearest_neighbours_f32, all_nearest_neighbours_k_f32, PyPreparedF32, "PreparedF32",
+                 GroupedQueriesF32, PyGroupedQueriesF32, "GroupedQueriesF32");
 
 /// Build a vertex-adjacency CSR graph from Delaunay tetrahedra (see the core
 /// [`crate::graph_from_simplices`]). Runs with the GIL released, so builds can
@@ -255,5 +390,7 @@ fn aann(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(graph_from_simplices, m)?)?;
     m.add_class::<PyPreparedF64>()?;
     m.add_class::<PyPreparedF32>()?;
+    m.add_class::<PyGroupedQueriesF64>()?;
+    m.add_class::<PyGroupedQueriesF32>()?;
     Ok(())
 }
