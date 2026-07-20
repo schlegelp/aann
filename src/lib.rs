@@ -23,7 +23,7 @@
 //! // Query cloud with its own neighbourhood graph (here: two points linked
 //! // to each other).
 //! let queries = array![[0.1, 0.0, 0.0], [0.9, 0.1, 0.0]];
-//! let (qptr, qidx) = (array![0usize, 1, 2], array![1usize, 0]);
+//! let (qptr, qidx) = (array![0u32, 1, 2], array![1u32, 0]);
 //! let (dists, idxs) = target.query(queries.view(), qptr.view(), qidx.view(), None);
 //! assert_eq!(idxs.to_vec(), vec![0, 1]);
 //! assert!((dists[0] - 0.1).abs() < 1e-12);
@@ -136,16 +136,16 @@ macro_rules! impl_ann_for {
         /// once at construction and reuses it across every query instead of
         /// repacking on each call.
         pub struct $nbhd<'a> {
-            indices: ArrayView1<'a, usize>,
-            neighbors: ArrayView1<'a, usize>,
+            indices: ArrayView1<'a, u32>,
+            neighbors: ArrayView1<'a, u32>,
             points_simd: Cow<'a, [$simd]>,
         }
 
         impl<'a> $nbhd<'a> {
             pub fn new(
                 points_simd: Cow<'a, [$simd]>,
-                indices: ArrayView1<'a, usize>,
-                neighbors: ArrayView1<'a, usize>,
+                indices: ArrayView1<'a, u32>,
+                neighbors: ArrayView1<'a, u32>,
             ) -> $nbhd<'a> {
                 $nbhd { indices, neighbors, points_simd }
             }
@@ -250,8 +250,9 @@ macro_rules! impl_ann_for {
 
         /// Neighbour indices of `vertex`, as a zero-copy slice.
         #[inline(always)]
-        fn $neigh<'a>(x: &$nbhd<'a>, vertex: usize) -> ArrayView1<'a, usize> {
-            x.neighbors.slice_move(s![x.indices[vertex]..x.indices[vertex + 1]])
+        fn $neigh<'a>(x: &$nbhd<'a>, vertex: usize) -> ArrayView1<'a, u32> {
+            x.neighbors
+                .slice_move(s![x.indices[vertex] as usize..x.indices[vertex + 1] as usize])
         }
 
         /// Approximate nearest neighbour of `p` among the points in `y`, via a
@@ -273,16 +274,21 @@ macro_rules! impl_ann_for {
             // inner loop indexes plain slices instead of rebuilding an ndarray
             // view (`$neigh`'s `slice_move(s![..])`) on every visited vertex.
             let pts: &[$simd] = &y.points_simd;
-            let indptr: &[usize] = y.indices.as_slice().expect("contiguous CSR indptr");
-            let neigh: &[usize] = y.neighbors.as_slice().expect("contiguous CSR neighbours");
+            let indptr: &[u32] = y.indices.as_slice().expect("contiguous CSR indptr");
+            let neigh: &[u32] = y.neighbors.as_slice().expect("contiguous CSR neighbours");
 
-            let mut vertex: usize = start;
-            let mut d = $dist(&pts[vertex], p);
+            // `vertex` is kept as `u32` -- the same type the CSR yields -- so the
+            // tie-break below compares two `u32`s. Mixing widths here would still
+            // order correctly at these magnitudes, but only accidentally; keeping
+            // one type makes the 0.2.1 ordering provably unchanged.
+            let mut vertex: u32 = start as u32;
+            let mut d = $dist(&pts[vertex as usize], p);
 
             loop {
                 let mut vert_new = false;
-                for &n in &neigh[indptr[vertex]..indptr[vertex + 1]] {
-                    let d_new = $dist(&pts[n], p);
+                let v = vertex as usize;
+                for &n in &neigh[indptr[v] as usize..indptr[v + 1] as usize] {
+                    let d_new = $dist(&pts[n as usize], p);
                     if d_new < d || (d_new == d && n < vertex) {
                         d = d_new;
                         vert_new = true;
@@ -293,7 +299,7 @@ macro_rules! impl_ann_for {
                     break;
                 }
             }
-            (d.sqrt(), vertex)
+            (d.sqrt(), vertex as usize)
         }
 
         /// PROTOTYPE -- blocked/batched k=1 all-nearest-neighbour descent.
@@ -338,8 +344,8 @@ macro_rules! impl_ann_for {
             }
             let xpts: &[$simd] = &x.points_simd;
             let ypts: &[$simd] = &y.points_simd;
-            let yindptr: &[usize] = y.indices.as_slice().expect("contiguous CSR indptr");
-            let yneigh: &[usize] = y.neighbors.as_slice().expect("contiguous CSR neighbours");
+            let yindptr: &[u32] = y.indices.as_slice().expect("contiguous CSR indptr");
+            let yneigh: &[u32] = y.neighbors.as_slice().expect("contiguous CSR neighbours");
 
             // Resolve the bound once (see `$resolve_prune`): None -> unbounded;
             // Some(None) -> whole query cloud out of range (all misses);
@@ -357,16 +363,18 @@ macro_rules! impl_ann_for {
 
             let block = block.max(1);
             // Per-block descent state (recycled across blocks). A pruned member is
-            // flagged with the `usize::MAX` sentinel in `cur` and never descends.
-            let mut cur: Vec<usize> = vec![0; block];
+            // flagged with the `u32::MAX` sentinel in `cur` and never descends
+            // (the CSR is `u32`, so the sentinel narrows with it; a cloud can hold
+            // at most `u32::MAX` vertices, so it never collides with a real id).
+            let mut cur: Vec<u32> = vec![0; block];
             let mut curd: Vec<$t> = vec![0.0; block];
             let mut done: Vec<bool> = vec![false; block];
             let mut order: Vec<usize> = Vec::with_capacity(block);
             // Gather buffer for one vertex's neighbour coordinates (reused).
             let mut coords: Vec<$simd> = Vec::with_capacity(32);
-            let mut nbrs: Vec<usize> = Vec::with_capacity(32);
+            let mut nbrs: Vec<u32> = Vec::with_capacity(32);
 
-            let mut seed = 0usize; // warm start carried across blocks
+            let mut seed = 0u32; // warm start carried across blocks
             let mut b0 = 0usize;
             while b0 < n_x {
                 let b1 = (b0 + block).min(n_x);
@@ -381,11 +389,11 @@ macro_rules! impl_ann_for {
                         _ => false,
                     };
                     if pruned {
-                        cur[k] = usize::MAX;
+                        cur[k] = u32::MAX;
                         done[k] = true;
                     } else {
                         cur[k] = seed;
-                        curd[k] = $dist(&ypts[seed], &xpts[gp]);
+                        curd[k] = $dist(&ypts[seed as usize], &xpts[gp]);
                         done[k] = false;
                         remaining += 1;
                     }
@@ -406,8 +414,9 @@ macro_rules! impl_ann_for {
                         // Gather vertex v's neighbour coordinates ONCE.
                         coords.clear();
                         nbrs.clear();
-                        for &nn in &yneigh[yindptr[v]..yindptr[v + 1]] {
-                            coords.push(ypts[nn]);
+                        let vu = v as usize;
+                        for &nn in &yneigh[yindptr[vu] as usize..yindptr[vu + 1] as usize] {
+                            coords.push(ypts[nn as usize]);
                             nbrs.push(nn);
                         }
                         // Advance every block member currently at v from `coords`.
@@ -418,8 +427,10 @@ macro_rules! impl_ann_for {
                             let mut best = curd[k];
                             // Incumbent *vertex id*, tracked alongside the
                             // distance so an exact tie can be broken on it
-                            // exactly as `$find` does (`bestj` indexes the
-                            // gather buffer, not `y`).
+                            // exactly as `$find` does. Both sides of that
+                            // comparison are `u32` vertex ids; `bestj` stays
+                            // `usize` because it indexes the gather buffer, not
+                            // `y`, and so keeps its own `usize::MAX` sentinel.
                             let mut bestv = cur[k];
                             let mut bestj = usize::MAX;
                             for (j, c) in coords.iter().enumerate() {
@@ -447,7 +458,7 @@ macro_rules! impl_ann_for {
                 // (a miss keeps the previous seed, mirroring `$search_into`).
                 for k in 0..bs {
                     let gp = b0 + k;
-                    if cur[k] == usize::MAX {
+                    if cur[k] == u32::MAX {
                         dists[gp] = <$t>::INFINITY;
                         idx[gp] = n_y;
                         continue;
@@ -461,7 +472,7 @@ macro_rules! impl_ann_for {
                         idx[gp] = n_y;
                     } else {
                         dists[gp] = curd[k].sqrt();
-                        idx[gp] = cur[k];
+                        idx[gp] = cur[k] as usize;
                         seed = cur[k];
                     }
                 }
@@ -520,8 +531,8 @@ macro_rules! impl_ann_for {
             let mut seed: usize = 0;
 
             // Raw slices over `x`'s CSR adjacency (see `$find`).
-            let xindptr: &[usize] = x.indices.as_slice().expect("contiguous CSR indptr");
-            let xneigh: &[usize] = x.neighbors.as_slice().expect("contiguous CSR neighbours");
+            let xindptr: &[u32] = x.indices.as_slice().expect("contiguous CSR indptr");
+            let xneigh: &[u32] = x.neighbors.as_slice().expect("contiguous CSR neighbours");
 
             // Two monomorphic walks so the common (unbounded / no-box-prune) path
             // carries zero per-point bound code -- the descent is only a few hops
@@ -553,7 +564,8 @@ macro_rules! impl_ann_for {
                             idx[v] = ix;
                             let child_start = if ix == n_y { start } else { seed = ix; ix };
 
-                            for &m in &xneigh[xindptr[v]..xindptr[v + 1]] {
+                            for &m in &xneigh[xindptr[v] as usize..xindptr[v + 1] as usize] {
+                                let m = m as usize;
                                 if visited[m] != gen {
                                     visited[m] = gen;
                                     stack.push((child_start, m));
@@ -577,7 +589,8 @@ macro_rules! impl_ann_for {
                             idx[v] = ix;
                             seed = ix;
 
-                            for &m in &xneigh[xindptr[v]..xindptr[v + 1]] {
+                            for &m in &xneigh[xindptr[v] as usize..xindptr[v + 1] as usize] {
+                                let m = m as usize;
                                 if visited[m] != gen {
                                     visited[m] = gen;
                                     stack.push((ix, m));
@@ -704,7 +717,7 @@ macro_rules! impl_ann_for {
                     break;
                 }
                 for n in $neigh(y, c.ix) {
-                    let n = *n;
+                    let n = *n as usize;
                     if visited[n] == gen {
                         continue;
                     }
@@ -779,7 +792,7 @@ macro_rules! impl_ann_for {
                     if let Some((bmin, bmax, ub2, check_points)) = prune2 {
                         if check_points && $box_dist2(&bmin, &bmax, &x.points_simd[v]) > ub2 {
                             for n2 in $neigh(x, v) {
-                                let m = *n2;
+                                let m = *n2 as usize;
                                 if !visited_x[m] {
                                     visited_x[m] = true;
                                     stack.push((seed, m));
@@ -813,7 +826,7 @@ macro_rules! impl_ann_for {
                     }
 
                     for n2 in $neigh(x, v) {
-                        let m = *n2;
+                        let m = *n2 as usize;
                         if !visited_x[m] {
                             visited_x[m] = true;
                             stack.push((seed, m));
@@ -838,8 +851,8 @@ macro_rules! impl_ann_for {
         /// this is a cloud-vs-cloud tool, not a scattered-point KD-tree lookup.
         pub struct $prepared {
             points_simd: Vec<$simd>,
-            indptr: Vec<usize>,
-            indices: Vec<usize>,
+            indptr: Vec<u32>,
+            indices: Vec<u32>,
             n: usize,
             /// Axis-aligned bounding box of the target points, computed once here
             /// so a bounded `query` can skip descents the box rules out (see
@@ -852,8 +865,8 @@ macro_rules! impl_ann_for {
         impl $prepared {
             pub fn new(
                 points: ArrayView2<$t>,
-                indptr: ArrayView1<usize>,
-                indices: ArrayView1<usize>,
+                indptr: ArrayView1<u32>,
+                indices: ArrayView1<u32>,
             ) -> Self {
                 let n = points.nrows();
                 let points_simd = $pack(points);
@@ -907,8 +920,8 @@ macro_rules! impl_ann_for {
             pub fn query(
                 &self,
                 x_points: ArrayView2<$t>,
-                x_indptr: ArrayView1<usize>,
-                x_indices: ArrayView1<usize>,
+                x_indptr: ArrayView1<u32>,
+                x_indices: ArrayView1<u32>,
                 ub: Option<$t>,
             ) -> (Array1<$t>, Array1<usize>) {
                 let x = $nbhd::new(Cow::Owned($pack(x_points)), x_indptr, x_indices);
@@ -920,8 +933,8 @@ macro_rules! impl_ann_for {
             pub fn query_k(
                 &self,
                 x_points: ArrayView2<$t>,
-                x_indptr: ArrayView1<usize>,
-                x_indices: ArrayView1<usize>,
+                x_indptr: ArrayView1<u32>,
+                x_indices: ArrayView1<u32>,
                 k: usize,
                 ef: usize,
                 ub: Option<$t>,
@@ -1030,8 +1043,8 @@ macro_rules! impl_ann_for {
                 // Descend the (already Morton-sorted) grouped points once. Dummy
                 // query CSR: the blocked descent walks points in order, never a
                 // query adjacency. Borrow the sorted points (no per-target copy).
-                let indptr: Vec<usize> = vec![0usize; n + 1];
-                let neighbors: Vec<usize> = Vec::new();
+                let indptr: Vec<u32> = vec![0u32; n + 1];
+                let neighbors: Vec<u32> = Vec::new();
                 let x = $nbhd::new(
                     Cow::Borrowed(gq.sorted.as_slice()),
                     ArrayView1::from(indptr.as_slice()),
@@ -1092,8 +1105,8 @@ macro_rules! impl_ann_for {
             pub fn query_into(
                 &self,
                 x_points: ArrayView2<$t>,
-                x_indptr: ArrayView1<usize>,
-                x_indices: ArrayView1<usize>,
+                x_indptr: ArrayView1<u32>,
+                x_indices: ArrayView1<u32>,
                 ws: &mut Workspace,
                 pack: &mut Vec<$simd>,
                 dists: &mut Vec<$t>,
@@ -1291,34 +1304,48 @@ pub fn morton_perm(pts: &[[f64; 3]]) -> Vec<usize> {
 ///
 /// Any vertex in `0..n_points` not referenced by a tetrahedron (e.g. an exact
 /// duplicate point dropped by the triangulator) is left with no neighbours.
+///
+/// # Panics
+///
+/// The CSR is `u32`, so a single cloud is capped at `u32::MAX` vertices and
+/// `u32::MAX` directed edges. Both are checked; neither is reachable from a
+/// Delaunay triangulation (`shull` itself refuses at `u32::MAX` points), but a
+/// silent wrap would corrupt the graph, so they panic rather than truncate.
 pub fn graph_from_simplices(
     simplices: ArrayView2<u64>,
     n_points: usize,
-) -> (Array1<usize>, Array1<usize>) {
-    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n_points];
+) -> (Array1<u32>, Array1<u32>) {
+    assert!(
+        n_points <= u32::MAX as usize,
+        "graph_from_simplices: {n_points} points exceeds the u32 CSR limit of {}",
+        u32::MAX
+    );
+    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n_points];
     for tet in simplices.outer_iter() {
         let v = [
-            tet[0] as usize,
-            tet[1] as usize,
-            tet[2] as usize,
-            tet[3] as usize,
+            tet[0] as u32,
+            tet[1] as u32,
+            tet[2] as u32,
+            tet[3] as u32,
         ];
         for a in 0..4 {
             for b in (a + 1)..4 {
-                adj[v[a]].push(v[b]);
-                adj[v[b]].push(v[a]);
+                adj[v[a] as usize].push(v[b]);
+                adj[v[b] as usize].push(v[a]);
             }
         }
     }
 
-    let mut indptr: Vec<usize> = Vec::with_capacity(n_points + 1);
+    let mut indptr: Vec<u32> = Vec::with_capacity(n_points + 1);
     indptr.push(0);
-    let mut indices: Vec<usize> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
     for nb in adj.iter_mut() {
         nb.sort_unstable();
         nb.dedup();
         indices.extend_from_slice(nb);
-        indptr.push(indices.len());
+        indptr.push(
+            u32::try_from(indices.len()).expect("graph_from_simplices: edge count exceeds u32"),
+        );
     }
     (Array1::from(indptr), Array1::from(indices))
 }
@@ -1333,7 +1360,7 @@ mod tests {
 
     /// The 4 corners of the unit tetrahedron plus their fully-connected CSR
     /// graph (from the single Delaunay simplex covering all of them).
-    fn tetrahedron() -> (Array2<f64>, Array1<usize>, Array1<usize>) {
+    fn tetrahedron() -> (Array2<f64>, Array1<u32>, Array1<u32>) {
         let points = array![
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0],
@@ -1399,7 +1426,7 @@ mod tests {
         let (points, indptr, indices) = tetrahedron();
         let query = array![[0.01, 0.0, 0.0]];
         // Single query point: trivial one-vertex graph with no neighbours.
-        let (qptr, qidx) = (array![0usize, 0], Array1::<usize>::zeros(0));
+        let (qptr, qidx) = (array![0u32, 0], Array1::<u32>::zeros(0));
 
         let target = PreparedF64::new(points.view(), indptr.view(), indices.view());
         let (dists, idxs) = target.query_k(query.view(), qptr.view(), qidx.view(), 2, 4, None);
@@ -1454,17 +1481,17 @@ mod tests {
     /// Complete graph on `n` vertices as CSR (every vertex neighbours all
     /// others). A superset of any Delaunay graph, so the greedy descent is
     /// provably exact on it -- the dependency-free 100%-recall oracle graph.
-    fn complete_graph_csr(n: usize) -> (Array1<usize>, Array1<usize>) {
+    fn complete_graph_csr(n: usize) -> (Array1<u32>, Array1<u32>) {
         let mut indptr = Vec::with_capacity(n + 1);
         let mut indices = Vec::with_capacity(n * n.saturating_sub(1));
         indptr.push(0);
         for v in 0..n {
             for u in 0..n {
                 if u != v {
-                    indices.push(u);
+                    indices.push(u as u32);
                 }
             }
-            indptr.push(indices.len());
+            indptr.push(indices.len() as u32);
         }
         (Array1::from(indptr), Array1::from(indices))
     }
@@ -1472,22 +1499,22 @@ mod tests {
     /// Sparse ring-lattice graph: each vertex links to +/-1, +/-2 (mod n).
     /// Forces multi-hop descents that exercise the warm-start chaining (needs
     /// `n >= 5` to stay simple/self-loop-free).
-    fn ring_graph_csr(n: usize) -> (Array1<usize>, Array1<usize>) {
+    fn ring_graph_csr(n: usize) -> (Array1<u32>, Array1<u32>) {
         let mut indptr = Vec::with_capacity(n + 1);
         let mut indices = Vec::new();
         indptr.push(0);
         for v in 0..n {
             let mut nb = vec![
-                (v + n - 2) % n,
-                (v + n - 1) % n,
-                (v + 1) % n,
-                (v + 2) % n,
+                ((v + n - 2) % n) as u32,
+                ((v + n - 1) % n) as u32,
+                ((v + 1) % n) as u32,
+                ((v + 2) % n) as u32,
             ];
             nb.sort_unstable();
             nb.dedup();
-            nb.retain(|&u| u != v);
+            nb.retain(|&u| u != v as u32);
             indices.extend_from_slice(&nb);
-            indptr.push(indices.len());
+            indptr.push(indices.len() as u32);
         }
         (Array1::from(indptr), Array1::from(indices))
     }
@@ -1741,6 +1768,98 @@ mod tests {
         };
         let best = pts.outer_iter().map(d2).fold(f64::INFINITY, f64::min);
         pts.outer_iter().filter(|r| d2(*r) == best).count()
+    }
+
+    /// The pre-0.2.2 `$find`, transcribed with `usize` indices throughout: the
+    /// greedy descent with the `(distance, vertex id)` tie-break. This is the
+    /// reference the `u32` CSR must reproduce exactly -- narrowing the index
+    /// type is a representation change, so every `(distance, index)` pair it
+    /// returns has to be bit-identical to what the wide version returned.
+    fn reference_descent_usize(
+        pts: &Array2<f64>,
+        indptr: &[usize],
+        indices: &[usize],
+        q: [f64; 3],
+        start: usize,
+    ) -> (f64, usize) {
+        let d2 = |i: usize| {
+            let r = pts.row(i);
+            let (dx, dy, dz) = (r[0] - q[0], r[1] - q[1], r[2] - q[2]);
+            dx * dx + dy * dy + dz * dz
+        };
+        let mut vertex: usize = start;
+        let mut d = d2(vertex);
+        loop {
+            let mut moved = false;
+            for &n in &indices[indptr[vertex]..indptr[vertex + 1]] {
+                let d_new = d2(n);
+                if d_new < d || (d_new == d && n < vertex) {
+                    d = d_new;
+                    moved = true;
+                    vertex = n;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+        (d.sqrt(), vertex)
+    }
+
+    #[test]
+    fn u32_csr_matches_usize_csr_bit_for_bit() {
+        // The whole claim of the u32 narrowing: same answers, fewer bytes. The
+        // risk sits in the tie-break -- comparing a u32 neighbour against a
+        // usize incumbent would still order correctly at these magnitudes, but
+        // only by accident, so pin it against a usize transcription of the
+        // descent.
+        //
+        // Driven through the public `find_nn_f64` with an *explicit* start, so
+        // this compares the descent primitive itself rather than the warm-start
+        // chaining order layered on top of it.
+        for (label, pts) in [
+            // Grid: exact ties everywhere (the case that motivated the
+            // tie-break), on both a complete and a sparse graph.
+            ("grid", grid_cloud(5)),
+            // Pseudo-random: generic, tie-free, deep descents.
+            ("lcg", lcg_cloud(200, 7)),
+        ] {
+            let n = pts.nrows();
+            for (gname, (indptr32, indices32)) in [
+                ("complete", complete_graph_csr(n)),
+                ("ring", ring_graph_csr(n)),
+            ] {
+                // The same graph widened back to usize for the reference.
+                let indptr_w: Vec<usize> = indptr32.iter().map(|&v| v as usize).collect();
+                let indices_w: Vec<usize> = indices32.iter().map(|&v| v as usize).collect();
+
+                let y = NeighborhoodF64::new(
+                    Cow::Owned(pack_points_f64(pts.view())),
+                    indptr32.view(),
+                    indices32.view(),
+                );
+
+                // Query points offset off-lattice so some land on exact ties.
+                for qi in 0..n {
+                    let r = pts.row(qi);
+                    let q = [r[0] + 0.5, r[1], r[2]];
+                    let qp = f64x4::from([q[0], q[1], q[2], 0.0]);
+                    // Every start vertex: the descent's answer is start-dependent
+                    // on a sparse graph, so a single start would hide a
+                    // divergence that only shows from elsewhere in the graph.
+                    for start in 0..n {
+                        let got = find_nn_f64(&y, &qp, start);
+                        let want =
+                            reference_descent_usize(&pts, &indptr_w, &indices_w, q, start);
+                        assert_eq!(
+                            got, want,
+                            "{label}/{gname}: query {qi} from start {start} \
+                             diverged (u32 {got:?} vs usize {want:?})"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

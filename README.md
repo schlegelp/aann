@@ -137,9 +137,11 @@ let points = array![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0
 let (indptr, indices) = graph_from_simplices(array![[0u64, 1, 2, 3]].view(), 4);
 let target = PreparedF64::new(points.view(), indptr.view(), indices.view());
 
-// Query cloud with its own CSR neighbourhood graph:
+// Query cloud with its own CSR neighbourhood graph (`u32` indices -- the
+// adjacency is the largest allocation in a big run, and a single cloud never
+// approaches 2^32 points):
 let queries = array![[0.1, 0.0, 0.0], [0.9, 0.1, 0.0]];
-let (qptr, qidx) = (array![0usize, 1, 2], array![1usize, 0]);
+let (qptr, qidx) = (array![0u32, 1, 2], array![1u32, 0]);
 let (dists, idxs) = target.query(queries.view(), qptr.view(), qidx.view());
 ```
 

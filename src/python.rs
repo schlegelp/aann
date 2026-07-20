@@ -43,11 +43,11 @@ macro_rules! impl_py_ann_for {
         fn $pyfn<'py>(
             py: Python<'py>,
             x_points: PyReadonlyArray2<$t>,
-            x_indices: PyReadonlyArray1<usize>,
-            x_neighbors: PyReadonlyArray1<usize>,
+            x_indices: PyReadonlyArray1<u32>,
+            x_neighbors: PyReadonlyArray1<u32>,
             y_points: PyReadonlyArray2<$t>,
-            y_indices: PyReadonlyArray1<usize>,
-            y_neighbors: PyReadonlyArray1<usize>,
+            y_indices: PyReadonlyArray1<u32>,
+            y_neighbors: PyReadonlyArray1<u32>,
         ) -> PyResult<(Bound<'py, PyArray1<$t>>, Bound<'py, PyArray1<usize>>)> {
             // Extract zero-copy views under the GIL (cheap), then release the GIL
             // for the whole search -- graph packing and descent are pure Rust.
@@ -76,11 +76,11 @@ macro_rules! impl_py_ann_for {
         fn $pyfnk<'py>(
             py: Python<'py>,
             x_points: PyReadonlyArray2<$t>,
-            x_indices: PyReadonlyArray1<usize>,
-            x_neighbors: PyReadonlyArray1<usize>,
+            x_indices: PyReadonlyArray1<u32>,
+            x_neighbors: PyReadonlyArray1<u32>,
             y_points: PyReadonlyArray2<$t>,
-            y_indices: PyReadonlyArray1<usize>,
-            y_neighbors: PyReadonlyArray1<usize>,
+            y_indices: PyReadonlyArray1<u32>,
+            y_neighbors: PyReadonlyArray1<u32>,
             k: usize,
             ef: usize,
         ) -> PyResult<(Bound<'py, PyArray2<$t>>, Bound<'py, PyArray2<usize>>)> {
@@ -112,8 +112,8 @@ macro_rules! impl_py_ann_for {
             #[new]
             fn new(
                 points: PyReadonlyArray2<$t>,
-                indptr: PyReadonlyArray1<usize>,
-                indices: PyReadonlyArray1<usize>,
+                indptr: PyReadonlyArray1<u32>,
+                indices: PyReadonlyArray1<u32>,
             ) -> Self {
                 $pywrap($prepared::new(
                     points.as_array(),
@@ -133,8 +133,8 @@ macro_rules! impl_py_ann_for {
                 &self,
                 py: Python<'py>,
                 x_points: PyReadonlyArray2<$t>,
-                x_indptr: PyReadonlyArray1<usize>,
-                x_indices: PyReadonlyArray1<usize>,
+                x_indptr: PyReadonlyArray1<u32>,
+                x_indices: PyReadonlyArray1<u32>,
                 distance_upper_bound: Option<$t>,
             ) -> PyResult<(Bound<'py, PyArray1<$t>>, Bound<'py, PyArray1<usize>>)> {
                 let xp = x_points.as_array();
@@ -154,8 +154,8 @@ macro_rules! impl_py_ann_for {
                 &self,
                 py: Python<'py>,
                 x_points: PyReadonlyArray2<$t>,
-                x_indptr: PyReadonlyArray1<usize>,
-                x_indices: PyReadonlyArray1<usize>,
+                x_indptr: PyReadonlyArray1<u32>,
+                x_indices: PyReadonlyArray1<u32>,
                 k: usize,
                 ef: usize,
                 distance_upper_bound: Option<$t>,
@@ -371,7 +371,7 @@ fn graph_from_simplices<'py>(
     py: Python<'py>,
     simplices: PyReadonlyArray2<u64>,
     n_points: usize,
-) -> PyResult<(Bound<'py, PyArray1<usize>>, Bound<'py, PyArray1<usize>>)> {
+) -> PyResult<(Bound<'py, PyArray1<u32>>, Bound<'py, PyArray1<u32>>)> {
     let s = simplices.as_array();
 
     let (indptr, indices) = py.detach(move || crate::graph_from_simplices(s, n_points));

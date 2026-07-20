@@ -24,6 +24,18 @@ __all__ = [
 # so they are handled identically.
 _DELAUNAY_TYPES = (Delaunay, shull.Delaunay)
 
+# dtype of the CSR neighbourhood graph (``indptr``/``indices``) handed to Rust.
+# The Rust side stores the adjacency as ``u32``, and ``PyReadonlyArray`` matches
+# dtype exactly -- no implicit cast -- so anything else raises ``TypeError`` at
+# the boundary rather than converting silently. This is also the cheaper cast on
+# our side: scipy hands back ``int32`` from both ``vertex_neighbor_vertices`` and
+# ``csr_matrix.indices``, so widening to 64 bits used to double the array only to
+# have Rust index a vertex set that never approaches 2**32.
+#
+# Consequence: a single cloud is capped at 2**32 - 1 points. The largest neuron
+# we have seen is ~14k, and shull's triangulator itself refuses at u32::MAX.
+_CSR_DTYPE = np.uint32
+
 
 # A neighbourhood graph ready to hand to the Rust search. ``perm`` is the point
 # permutation applied by cache-locality reordering (new index -> original
@@ -708,8 +720,8 @@ def _reorder(points, indptr, indices, perm):
     a.sort_indices()
     return (
         points[perm],
-        a.indptr.astype(np.uint64, copy=False),
-        a.indices.astype(np.uint64, copy=False),
+        a.indptr.astype(_CSR_DTYPE, copy=False),
+        a.indices.astype(_CSR_DTYPE, copy=False),
     )
 
 
@@ -727,8 +739,8 @@ def _build_graph(obj, graph, graph_k, backend="shull"):
         indptr, indices = obj.vertex_neighbor_vertices
         return (
             points.astype(np.float64, copy=False),
-            np.asarray(indptr).astype(np.uint64, copy=False),
-            np.asarray(indices).astype(np.uint64, copy=False),
+            np.asarray(indptr).astype(_CSR_DTYPE, copy=False),
+            np.asarray(indices).astype(_CSR_DTYPE, copy=False),
         )
 
     _assert_cloud_3d(obj)
@@ -745,8 +757,8 @@ def _build_graph(obj, graph, graph_k, backend="shull"):
         indptr, indices = d.vertex_neighbor_vertices
         return (
             d.points.astype(np.float64, copy=False),
-            indptr.astype(np.uint64, copy=False),
-            indices.astype(np.uint64, copy=False),
+            indptr.astype(_CSR_DTYPE, copy=False),
+            indices.astype(_CSR_DTYPE, copy=False),
         )
     elif graph == "knn":
         return _knn_graph(points, graph_k)
@@ -770,8 +782,8 @@ def _delaunay_shull(points):
     d = shull.Delaunay3d(points)
     simplices = np.ascontiguousarray(d.simplices, dtype=np.uint64)
     indptr, indices = _aann.graph_from_simplices(simplices, len(points))
-    indptr = np.asarray(indptr, dtype=np.uint64)
-    indices = np.asarray(indices, dtype=np.uint64)
+    indptr = np.asarray(indptr, dtype=_CSR_DTYPE)
+    indices = np.asarray(indices, dtype=_CSR_DTYPE)
 
     coplanar = np.asarray(d.coplanar)
     if len(coplanar) == 0:
@@ -793,8 +805,8 @@ def _delaunay_shull(points):
     g.sort_indices()
     return (
         points,
-        g.indptr.astype(np.uint64, copy=False),
-        g.indices.astype(np.uint64, copy=False),
+        g.indptr.astype(_CSR_DTYPE, copy=False),
+        g.indices.astype(_CSR_DTYPE, copy=False),
     )
 
 
@@ -820,8 +832,8 @@ def _knn_graph(points, k):
 
     return (
         points,
-        g.indptr.astype(np.uint64, copy=False),
-        g.indices.astype(np.uint64, copy=False),
+        g.indptr.astype(_CSR_DTYPE, copy=False),
+        g.indices.astype(_CSR_DTYPE, copy=False),
     )
 
 
