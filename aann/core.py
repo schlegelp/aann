@@ -176,10 +176,11 @@ class AANN:
                 Opt into the *blocked/batched* descent (experimental). It processes
                 query points in blocks so that query points sharing a target vertex
                 have that vertex's neighbours gathered once and reused -- roughly
-                ~1.4x faster on the descent, memory-bandwidth bound. Results are
+                ~1.4x faster on the descent, memory-bandwidth bound. Distances are
                 **identical** to the default path (k=1 is exact on a Delaunay graph
-                regardless of the descent's start), up to occasional exact-distance
-                ties in the returned *index*. Only takes effect on the fast
+                regardless of the descent's start); indices likewise, except in the
+                pathological tie case noted under :func:`all_by_all_grouped`. Only
+                takes effect on the fast
                 prepared-vs-prepared ``k=1`` path (``x`` is an ``AANN``); it is
                 silently ignored for ``k>1``, raw/``Delaunay`` ``x`` -- those use the
                 standard path. ``distance_upper_bound`` is supported. Default False.
@@ -413,8 +414,9 @@ def all_by_all_grouped(anns, pairs=None, workers=None, distance_upper_bound=None
     they run a single time up front (in Rust, GIL released) rather than once per
     target; each per-target call then only descends + finalizes (mapping back to
     each operand's original point/index order, also in Rust). Python only slices the
-    result. Output is **identical** to :func:`all_by_all` (up to exact-distance ties
-    in the returned index).
+    result. Distances are **identical** to :func:`all_by_all`; indices are identical
+    wherever the nearest neighbour is unique, and both paths resolve exact-distance
+    ties the same way in all but pathological cases (see Notes).
 
     Parameters
     ----------
@@ -429,8 +431,9 @@ def all_by_all_grouped(anns, pairs=None, workers=None, distance_upper_bound=None
     Returns
     -------
     list of (distances, indices)
-        One ``(d, i)`` per entry in ``pairs``, in the same order -- identical to
-        ``all_by_all(..., k=1)``.
+        One ``(d, i)`` per entry in ``pairs``, in the same order. Distances match
+        ``all_by_all(..., k=1)`` exactly; indices match except at rare exact-distance
+        ties (see Notes).
 
     Notes
     -----
@@ -463,6 +466,19 @@ def all_by_all_grouped(anns, pairs=None, workers=None, distance_upper_bound=None
     - **Does not avoid the O(N²) pairs list.** Like :func:`all_by_all` it still needs
       ``pairs`` enumerated; ``pairs=None`` at very large N is infeasible for both --
       pre-filter to spatially-near pairs first.
+    - **Exact-distance ties are near-deterministic, not guaranteed.** When a query
+      point is exactly equidistant from several target points, the descent returns
+      the one with the **lowest target index**. Ties are common on grid-quantised
+      clouds (e.g. resampled skeletons) and rare on continuous data. This makes the
+      returned index independent of *which clouds were passed in* for effectively
+      all real inputs -- worth knowing, because the grouped set is built from **all**
+      of ``anns`` (not just those named in ``pairs``), so the Morton order, and hence
+      each descent's start vertex, shifts when you hand in a different set of
+      clouds. A residual case survives: two equidistant targets are only compared if
+      the descent actually visits both, which is not guaranteed when they are not
+      adjacent in the target's graph. Measured at ~0.02% of tied query points on
+      random grid-quantised clouds. If you need a bit-stable index across differing
+      cloud sets, do not rely on this.
     """
     anns = list(anns)
     for a in anns:

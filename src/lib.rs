@@ -255,10 +255,19 @@ macro_rules! impl_ann_for {
         }
 
         /// Approximate nearest neighbour of `p` among the points in `y`, via a
-        /// greedy descent that starts at `start`. The descent only moves to a
-        /// strictly-closer node, so the running distance is always the smallest
-        /// seen and an already-examined node can never be re-selected -- hence no
-        /// explicit "visited" set is needed.
+        /// greedy descent that starts at `start`. The descent moves to a
+        /// strictly-closer node, or -- on an exact distance tie -- to the one
+        /// with the lower vertex id. Without that tie-break the incumbent always
+        /// wins, so which of several equidistant points is returned depends on
+        /// the start vertex, and the start vertex depends on how the caller
+        /// batched its queries (see `morton_perm`). Ties are common on
+        /// grid-quantised clouds (e.g. resampled skeletons), where the unstable
+        /// index picks a different tangent vector downstream.
+        ///
+        /// Still terminates without a "visited" set: `(distance, vertex id)`
+        /// decreases lexicographically on every move, so no node can be
+        /// re-selected -- a lateral move strictly lowers the id, and any later
+        /// strict improvement lowers the distance.
         pub fn $find(y: &$nbhd, p: &$simd, start: usize) -> ($t, usize) {
             // Hoist the CSR/point access to raw slices once per descent, so the
             // inner loop indexes plain slices instead of rebuilding an ndarray
@@ -274,7 +283,7 @@ macro_rules! impl_ann_for {
                 let mut vert_new = false;
                 for &n in &neigh[indptr[vertex]..indptr[vertex + 1]] {
                     let d_new = $dist(&pts[n], p);
-                    if d_new < d {
+                    if d_new < d || (d_new == d && n < vertex) {
                         d = d_new;
                         vert_new = true;
                         vertex = n;
@@ -301,9 +310,12 @@ macro_rules! impl_ann_for {
         /// `prune = Some((tmin, tmax, ub, qbox?))` applies a `distance_upper_bound`
         /// exactly as `$search_into` does (whole-cloud short-circuit, per-point box
         /// prune, after-descent miss marking `(inf, |y|)`); `None` is unbounded.
-        /// Results are identical to the sequential path point-for-point (k=1 is exact
+        /// Distances are identical to the sequential path point-for-point (k=1 is exact
         /// on a Delaunay graph regardless of the descent's start vertex); only the
-        /// *order* of gathers differs. Additive prototype -- `$search_into` untouched.
+        /// *order* of gathers differs. Indices agree wherever the nearest neighbour is
+        /// unique, and share the same lower-vertex-id tie-break otherwise -- see `$find`
+        /// for the residual start-vertex dependence at ties. Additive prototype --
+        /// `$search_into` untouched.
         pub fn $search_blocked(
             x: &$nbhd,
             y: &$nbhd,
@@ -404,11 +416,17 @@ macro_rules! impl_ann_for {
                             let k = order[gj];
                             let p = &xpts[b0 + k];
                             let mut best = curd[k];
+                            // Incumbent *vertex id*, tracked alongside the
+                            // distance so an exact tie can be broken on it
+                            // exactly as `$find` does (`bestj` indexes the
+                            // gather buffer, not `y`).
+                            let mut bestv = cur[k];
                             let mut bestj = usize::MAX;
                             for (j, c) in coords.iter().enumerate() {
                                 let dn = $dist(c, p);
-                                if dn < best {
+                                if dn < best || (dn == best && nbrs[j] < bestv) {
                                     best = dn;
+                                    bestv = nbrs[j];
                                     bestj = j;
                                 }
                             }
@@ -612,6 +630,22 @@ macro_rules! impl_ann_for {
 
         /// A (squared distance, index) pair with a total order on the distance
         /// (`total_cmp`), so it can live in a `BinaryHeap` despite the float key.
+        ///
+        /// NOTE (unfixed): the order is on the distance *alone*, so equidistant
+        /// points compare `Equal` and their relative order falls out of heap
+        /// internals and insertion order -- which depend on the start vertex, and
+        /// hence on how the caller batched its queries. This is the same tie
+        /// instability the k=1 descent had (see `$find`, fixed there by preferring
+        /// the lower vertex id); on grid-quantised clouds it means `$searchk` can
+        /// return a different index set for the same query depending on the batch.
+        ///
+        /// Adding `.then(self.ix.cmp(&other.ix))` below would make the *comparison*
+        /// canonical, but unlike k=1 that would not be enough to make the result
+        /// canonical: `$findk` is a beam search bounded by `ef`, so which tied
+        /// points are ever enqueued is itself start-dependent, and at the k-th
+        /// position a tie spanning the cutoff changes set membership, not just
+        /// ordering. Deliberately left alone pending a decision on what k>1 should
+        /// guarantee.
         #[derive(Clone, Copy)]
         struct $hitem {
             d: $t,
@@ -644,6 +678,9 @@ macro_rules! impl_ann_for {
         /// stamps nodes with the query's generation `gen` -- an O(1) reset per
         /// query (the array is zero-filled only when the u32 counter wraps).
         /// All buffers are caller-owned and reused across queries.
+        ///
+        /// Also unlike k=1, exact-distance ties here are *not* resolved to a stable
+        /// index -- the returned set can shift with `start`. See `$hitem`'s `Ord`.
         fn $findk(
             y: &$nbhd,
             p: &$simd,
@@ -1683,5 +1720,117 @@ mod tests {
         let (db, ib) = tgt.query_prepared_k(&qry, k, k, Some(1000.0));
         assert_eq!(d0, db);
         assert_eq!(i0, ib);
+    }
+
+    /// `n`-per-axis unit-spaced grid, in row-major (x, y, z) order.
+    fn grid_cloud(n: usize) -> Array2<f64> {
+        let mut pts = Array2::<f64>::zeros((n * n * n, 3));
+        for i in 0..n * n * n {
+            pts[[i, 0]] = (i / (n * n)) as f64;
+            pts[[i, 1]] = ((i / n) % n) as f64;
+            pts[[i, 2]] = (i % n) as f64;
+        }
+        pts
+    }
+
+    /// How many points sit at the (exact) minimum distance from `q`.
+    fn tie_multiplicity(pts: &Array2<f64>, q: [f64; 3]) -> usize {
+        let d2 = |row: ndarray::ArrayView1<f64>| {
+            let (dx, dy, dz) = (row[0] - q[0], row[1] - q[1], row[2] - q[2]);
+            dx * dx + dy * dy + dz * dz
+        };
+        let best = pts.outer_iter().map(d2).fold(f64::INFINITY, f64::min);
+        pts.outer_iter().filter(|r| d2(*r) == best).count()
+    }
+
+    #[test]
+    fn ties_resolve_to_lowest_vertex_id_regardless_of_start() {
+        // Grid-quantised clouds -- what resampled neuron skeletons look like --
+        // make exact distance ties common: a query on a cell face/edge/centre is
+        // equidistant from 2, 4 or 8 targets. With a strict `<` the incumbent
+        // wins every tie, so the returned index depends on where the descent
+        // started, and the start depends on how the *caller* batched its queries
+        // (`GroupedQueriesF64::prepare` re-derives the Morton bbox from whatever
+        // subset it was handed). Distances stay bit-identical, but the index
+        // shift picks a different tangent vector downstream. Pin the rule.
+        //
+        // Complete target graph: every descent sees every target, isolating tie
+        // resolution from the graph's local minima.
+        let pts = grid_cloud(4);
+        let n = pts.nrows();
+        let (indptr, indices) = complete_graph_csr(n);
+        let y = NeighborhoodF64::new(
+            Cow::Owned(pack_points_f64(pts.view())),
+            indptr.view(),
+            indices.view(),
+        );
+
+        // Face midpoint (2-way tie), edge midpoint (4-way), cell centre (8-way).
+        for q in [[0.5, 0.0, 0.0], [1.0, 1.5, 2.5], [2.5, 1.5, 0.5]] {
+            let ties = tie_multiplicity(&pts, q);
+            assert!(ties > 1, "query {q:?} was meant to be tied, got {ties} minimum");
+            // `brute_nn` scans ascending under a strict `<`, so it too keeps the
+            // lowest tied id -- the answer the descent must agree on.
+            let expect = brute_nn(&pts, q).0;
+
+            let packed = pack_points_f64(array![[q[0], q[1], q[2]]].view());
+            for start in 0..n {
+                let (_, ix) = find_nn_f64(&y, &packed[0], start);
+                assert_eq!(
+                    ix, expect,
+                    "query {q:?} ({ties}-way tie) resolved to {ix} from start {start}, expected {expect}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_and_sequential_agree_on_ties() {
+        // The same tie, reached through the two descents that differ only in how
+        // they seed: `search_f64` walks the query graph depth-first, the blocked
+        // path carries a warm seed along Morton-ordered blocks whose boundaries
+        // move with `block`. Before the tie-break these disagreed on grid data.
+        let pts_t = grid_cloud(5);
+        let (tptr, tidx) = complete_graph_csr(pts_t.nrows());
+        let y = NeighborhoodF64::new(
+            Cow::Owned(pack_points_f64(pts_t.view())),
+            tptr.view(),
+            tidx.view(),
+        );
+
+        // Every query sits on a cell face along z -> a 2-way tie between two
+        // *consecutive* target ids (z is the fastest-varying axis). Walking the
+        // queries in descending z then hands each descent a warm seed that is
+        // the higher member of the next query's tie -- precisely the case an
+        // incumbent-wins comparison resolves the wrong way.
+        let mut pts_q = grid_cloud(4);
+        pts_q.column_mut(2).iter_mut().for_each(|v| *v += 0.5);
+        pts_q = pts_q.slice(s![..;-1, ..]).to_owned();
+        let (qptr, qidx) = ring_graph_csr(pts_q.nrows());
+        let x = NeighborhoodF64::new(
+            Cow::Owned(pack_points_f64(pts_q.view())),
+            qptr.view(),
+            qidx.view(),
+        );
+
+        let truth: Vec<usize> = (0..pts_q.nrows())
+            .map(|v| brute_nn(&pts_t, [pts_q[[v, 0]], pts_q[[v, 1]], pts_q[[v, 2]]]).0)
+            .collect();
+        assert!(
+            (0..pts_q.nrows())
+                .all(|v| tie_multiplicity(&pts_t, [pts_q[[v, 0]], pts_q[[v, 1]], pts_q[[v, 2]]]) == 2),
+            "queries were meant to be uniformly 2-way tied"
+        );
+
+        let (_, seq) = search_f64(&x, &y);
+        assert_eq!(seq.to_vec(), truth, "sequential descent");
+
+        // Block sizes that do and don't divide the cloud, so block boundaries --
+        // and hence the warm seed at each block's start -- land differently.
+        for block in [1usize, 3, 8, 64, 1000] {
+            let (mut d, mut ix) = (Vec::new(), Vec::new());
+            search_blocked_f64(&x, &y, &mut d, &mut ix, block, None);
+            assert_eq!(ix, truth, "blocked descent, block = {block}");
+        }
     }
 }
